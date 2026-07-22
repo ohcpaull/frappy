@@ -1,10 +1,10 @@
 from os import environ
 
 # either change the uri or set the environment variable 'LS_URI'
-lakeshore_uri = environ.get('LS_URI', 'tcp://<host>:7777')
+lakeshore_uri = environ.get('LS_URI', 'tcp://10.157.205.163:7777')
 
-Node('example_cryo.psi.ch',  # a globally unique identification
-     'this is an example cryostat for the Frappy tutorial',  # describes the node
+Node('ls336.platypus.acns',  # a globally unique identification
+     'Lakeshore 336 node ',  # describes the node
       interface='tcp://10767')  # you might choose any port number > 1024
 IO('io', lakeshore_uri)  # the communicator (its class will be detected automatically)
 Mod('T',
