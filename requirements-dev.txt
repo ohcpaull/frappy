@@ -1,0 +1,13 @@
+# doc
+sphinx_rtd_theme
+Sphinx>=1.2.1
+# for generating docu
+markdown>=2.6
+rst2pdf
+# test suite
+pytest
+pytest-randomly>=1.1
+pytest-cov
+# frappy mlz
+zapf >= 0.4.7
+pytango >= 10.0.0

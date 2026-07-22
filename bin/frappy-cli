@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+# *****************************************************************************
+# Copyright (c) 2015-2024 by the authors, see LICENSE
+#
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation; either version 2 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program; if not, write to the Free Software Foundation, Inc.,
+# 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+# Module authors:
+#   Alexander Lenz <alexander.lenz@frm2.tum.de>
+#   Markus Zolliker <markus.zolliker@psi.ch>
+#
+# *****************************************************************************
+
+import sys
+import argparse
+from pathlib import Path
+
+# Add import path for inplace usage
+sys.path.insert(0, str(Path(__file__).absolute().parents[1]))
+
+from frappy.client.interactive import init, run, clientenv, interact
+
+
+def parseArgv(argv):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-i', '--include',
+                        help='file to execute after connecting to the clients', metavar='file',
+                        type=Path, action='append', default=[])
+    parser.add_argument('-o', '--only-execute',
+                        help='Do not go into interactive mode after executing files. \
+                        Has no effect without --include.', action='store_true')
+    parser.add_argument('node',
+                        help='Nodes the client should connect to.\n', metavar='host:port',
+                        nargs='*', type=str, default=[])
+    return parser.parse_args(argv)
+
+
+args = parseArgv(sys.argv[1:])
+
+success = init(*args.node)
+
+run_error = ''
+file_success = False
+try:
+    for file in args.include:
+        run(file)
+    file_success = True
+except Exception as e:
+    run_error = f'\n{clientenv.short_traceback()}'
+
+if success:
+    if args.include and file_success and args.only_execute:
+        print('skipping interactive mode')
+        exit()
+    interact(run_error)

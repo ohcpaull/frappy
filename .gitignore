@@ -1,0 +1,26 @@
+frappydemo.PID
+log/*
+html/*
+*.pyc
+pid/*
+
+# ide
+.idea
+
+RELEASE-VERSION
+build
+*.egg-info
+
+# Sphinx
+doc/_build
+
+# Mac
+.DS_Store
+
+# pytest
+.cache
+.coverage
+._*
+
+# pyinstaller
+dist/

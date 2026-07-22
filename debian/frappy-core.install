@@ -1,0 +1,15 @@
+usr/bin/frappy-cli
+usr/bin/frappy-server
+usr/bin/frappy-play
+usr/bin/frappy-scan
+usr/lib/python3.*/dist-packages/frappy/*.py
+usr/lib/python3.*/dist-packages/frappy/__pycache__
+usr/lib/python3.*/dist-packages/frappy/lib
+usr/lib/python3.*/dist-packages/frappy/client
+usr/lib/python3.*/dist-packages/frappy/protocol
+usr/lib/python3.*/dist-packages/frappy_core-*
+usr/lib/python3.*/dist-packages/frappy/RELEASE-VERSION
+usr/lib/python3.*/dist-packages/frappy_demo
+usr/lib/systemd
+var/log/frappy
+etc/generalConfig.cfg etc/frappy
