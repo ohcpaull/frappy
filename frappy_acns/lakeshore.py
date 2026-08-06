@@ -34,13 +34,13 @@ class LakeshoreIO(StringIO):
     default_settings = {'port': 7777, 'baudrate': 57600, 'parity': 'O', 'bytesize': 7}
 
 class TemperatureSetpoint(HasIO, Readable):
-    """ A temperature setpoint (generic for different models"""
+    """ A temperature setpoint (generic for different models)"""
     ioClass = LakeshoreIO
 
-    output = Property('the Lakeshore channel', datatype=StringType())
-    target = Parameter(datatype=FloatRange(0,1500, unit='K'))
+    output = Property('the Lakeshore heater output', datatype=IntRange(1,2), default=1)
+    setpoint = Parameter('the setpoint temperature', datatype=FloatRange(0,1500, unit='K'))
 
-    def read_value(self):
+    def read_setpoint(self):
         reply = self.communicate(f'SETP?{self.output}')
         return float(reply)
 
@@ -82,7 +82,7 @@ class TemperatureLoop(TemperatureSensor, TemperatureSetpoint, Drivable):
     ioClass = LakeshoreIO
     # lakeshore loop number to be used for this module
     loop = Property('lakeshore loop', IntRange(1, 2), default=1)
-    #target = Parameter(datatype=FloatRange(unit='K', min=0, max=1500))
+    target = Parameter(datatype=FloatRange(unit='K', min=0, max=1500))
     heater_range = Property('heater power range', IntRange(0, 5))  # max. 3 on LakeShore 336
     tolerance = Parameter('convergence criterion', FloatRange(0), default=0.1, readonly=False)
     _driving = False
