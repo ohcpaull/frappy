@@ -32,7 +32,7 @@ from frappy.datatypes import ArrayOf, BLOBType, BoolType, FloatRange, \
 from frappy.errors import CommunicationFailedError, ConfigError, \
     ProgrammingError, SECoPError, SilentCommunicationFailedError as SilentError
 from frappy.lib import generalConfig
-from frappy.lib.asynconn import AsynConn, ConnectionClosed
+from frappy.lib.asynconn import AsynConn, ConnectionClosed, AsynTcp
 from frappy.modules import Attached, Command, Communicator, Module, \
     Parameter, Property
 
@@ -492,7 +492,10 @@ class BytesIO(IOBase):
                         self.comLog('garbage: %r', garbage)
                     self._conn.send(request)
                     self.comLog('> %s', hexify(request))
-                    reply = self._conn.readbytes(replylen, self.timeout)
+                    if replylen is None:
+                        reply = self._conn.readline()
+                    else:
+                        reply = self._conn.readbytes(replylen, self.timeout)
                 except ConnectionClosed:
                     self.closeConnection()
                     raise CommunicationFailedError('disconnected') from None
