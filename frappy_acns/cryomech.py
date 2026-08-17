@@ -35,7 +35,16 @@ data_dictionary = {
     "Compressor_minutes" : bytes([ADDRESS, CMD, READ, 0x45, 0x4C, 0x00]),
     "Input_water_temp" : bytes([ADDRESS, CMD, READ, 0x0D, 0x8F, 0x00]),
     "Output_water_temp": bytes([ADDRESS, CMD, READ, 0x0D, 0x8F, 0x01]),
-    "Error_code_status": bytes([ADDRESS, CMD, READ, 0x65, 0xA4, 0x00])
+    "Helium_temp": bytes([ADDRESS, CMD, READ, 0x0D, 0x8F, 0x02]),
+    "Oil_temp": bytes([ADDRESS, CMD, READ, 0x0D, 0x8F, 0x03]),
+    "Error_code_status": bytes([ADDRESS, CMD, READ, 0x65, 0xA4, 0x00]),
+    "High_pressure": bytes([ADDRESS, CMD, READ, 0xAA, 0x50, 0x00]),
+    "Low_pressure": bytes([ADDRESS, CMD, READ, 0xAA, 0x50, 0x01]),
+    "Min_high_pressure": bytes([ADDRESS, CMD, READ, 0x5E, 0x0B, 0x00]),
+    "Min_low_pressure": bytes([ADDRESS, CMD, READ, 0x5E, 0x0B, 0x01]),
+    "Max_high_pressure": bytes([ADDRESS, CMD, READ, 0x7A, 0x62, 0x00]),
+    "Max_low_pressure": bytes([ADDRESS, CMD, READ, 0x7A, 0x62, 0x01]),
+    "Pressure_status": bytes([ADDRESS, CMD, READ, 0xF8, 0x2B, 0x00])
 }    
 
 # TODO: check whether EOL is added to bytes sent
@@ -94,29 +103,24 @@ class CryomechIO(BytesIO):
         #with self._lock:
         frame = bytearray()
         frame.append(START)
-        #frame.append(ADDRESS)
-        #frame.append(CMD)
         frame.extend(self.add_escape_chars(command)) # Add escape bytes to command and append to  frame
 
         checksum = self.calculate_crc(command) # calculate checksum on <ADDRESS>, <CMD>, <Data bytes> 
-        #self.log.info(f"checksum argument = {command}")
-        #self.log.info(f"checksum output = {checksum}")
         frame.extend(checksum)
         frame.append(CR)
-        #self.log.info(f"byte frame size = {len(frame)}")
-        #self.log.info(f"byte frame after escape chars: {frame}")
-        self.log.info(f"frame = {frame}")
+        # self.log.info(f"frame = {frame}")
 
 
-        raw_response = super().communicate(frame, 14)
-        self.log.info(f"raw response: {raw_response}")
-        unescaped = self.remove_escape_chars(raw_response[1:-3])
+        raw_response = bytearray(super().communicate(frame, None))
+        raw_response.append(0x0D)  # Add EOL character for response treatment
+        # self.log.info(f"raw response: {raw_response}")
+        unescaped = self.remove_escape_chars(raw_response[1:-3]) 
         response = bytearray()
         response.append(raw_response[0])
         response.extend(unescaped)
         response.extend(raw_response[-3:])
 
-        self.log.info(f"unescaped response = {response}")
+        # self.log.info(f"unescaped response = {response}")
         if response[0] != 0x02:
             raise CommunicationFailedError('Invalid response: missing STX')
         if response[1] != ADDRESS:
@@ -125,9 +129,7 @@ class CryomechIO(BytesIO):
         if self.check_crc(response) == False:
             self.log.info(f"response for checksum = {response[1:-3]}")
             raise CommunicationFailedError(f'Bad crc: response {response[-3:-1]} does not equal {self.calculate_crc(bytes(response[1:-3]))}')
-        #if response[2] != 0x80:
-        #    raise CommunicationFailedError('Invalid response: incorrect command/response byte')
-        return response[7:-3]  # Return the data field, excluding STX,
+        return response[7:-3]  # Return the data field of reply only
 
     @staticmethod
     def calculate_crc(command: bytes) -> bytes:
@@ -200,12 +202,14 @@ class CryomechIO(BytesIO):
         return bytes(unescaped)
 
 
-class CP1000(HasIO, Readable):
+class CP1000Temperatures(HasIO, Readable):
     ioClass = CryomechIO
-    value = Parameter('Input water temperature', datatype=FloatRange(unit='C'))
-    #CPU_temp= Parameter('CPU Temperature', datatype=FloatRange(unit='C'))
+    output_water_temp = Parameter('Output water temperature', datatype=FloatRange(unit='C'))
+    helium_temp = Parameter('Helium temperature', datatype=FloatRange(unit='C'))
+    oil_temp = Parameter('Oil temperature', datatype=FloatRange(unit='C'))
+    CPU_temp= Parameter('CPU Temperature', datatype=FloatRange(unit='C'))
 
-    def read_value(self):
+    def read_output_water_temp(self):
         response = self.communicate(data_dictionary["Output_water_temp"])
         float_val = float(struct.unpack('>i', response)[0]/10)
         return float_val
@@ -223,9 +227,70 @@ class CP1000(HasIO, Readable):
         elif response == 4:
             text = "Compressor is in lockout mode"
         else:
-            text = "no error"
+            text = "no error" #TODO: Get full table of error codes
         return ERROR, text
 
-    #def read_CPU_temp(self):
-    #    return float(self.communicate(data_dictionary["CPU_temp"]))
-        
+    def read_oil_temp(self):
+        response = self.communicate(data_dictionary["Oil_temp"])
+        float_val = float(struct.unpack('>i', response)[0]/10)
+        return float_val
+
+    def read_helium_temp(self):
+        response = self.communicate(data_dictionary["Helium_temp"])
+        float_val = float(struct.unpack('>i', response)[0]/10)
+        return float_val
+    
+    def read_CPU_temp(self):
+        response = self.communicate(data_dictionary["CPU_temp"])
+        float_val = float(struct.unpack('>i', response)[0]/10)
+        return float_val
+
+    
+class CP1000Pressures(HasIO, Readable):
+    ioClass = CryomechIO
+    high_pressure = Parameter('High side pressure', datatype=FloatRange(unit='psi'))
+    low_pressure = Parameter('Low side pressure', datatype=FloatRange(unit='psi'))
+    max_high_pressure = Parameter('Maximum high side pressure', datatype=FloatRange(unit='psi'))
+    max_low_pressure = Parameter('Maximum low side pressure', datatype=FloatRange(unit='psi'))
+    min_high_pressure = Parameter('Minimum high side pressure', datatype=FloatRange(unit='psi'))
+    min_low_pressure = Parameter('Minimum low side pressure', datatype=FloatRange(unit='psi'))
+
+
+    def read_high_pressure(self):
+        response = self.communicate(data_dictionary["High_pressure"])
+        float_val = float(struct.unpack('>i', response)[0]/10)
+        return float_val
+
+    def read_low_pressure(self):
+        response = self.communicate(data_dictionary["Low_pressure"])
+        float_val = float(struct.unpack('>i', response)[0]/10)
+        return float_val
+
+    def read_max_high_pressure(self):
+        response = self.communicate(data_dictionary["Max_high_pressure"])
+        float_val = float(struct.unpack('>i', response)[0]/10)
+        return float_val
+
+    def read_max_low_pressure(self):
+        response = self.communicate(data_dictionary["Max_low_pressure"])
+        float_val = float(struct.unpack('>i', response)[0]/10)
+        return float_val
+
+    def read_min_high_pressure(self):
+        response = self.communicate(data_dictionary["Min_high_pressure"])
+        float_val = float(struct.unpack('>i', response)[0]/10)
+        return float_val
+
+    def read_min_low_pressure(self):
+        response = self.communicate(data_dictionary["Min_low_pressure"])
+        float_val = float(struct.unpack('>i', response)[0]/10)
+        return float_val
+
+    def read_status(self):
+        response = int(struct.unpack('>i', self.communicate(data_dictionary['Pressure_status']))[0])
+
+        if response == 1:
+            text = "Pressure sensor failed"
+            return ERROR, text
+        else:
+            return IDLE, "no error"
