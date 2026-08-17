@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from frappy.core import Readable, Writable, Parameter, Communicator, Module, FloatRange, HasIO, StringIO, Property, StringType, \
-    IDLE, BUSY, WARN, ERROR, DISABLED, Drivable, IntRange, BoolType
+    IDLE, BUSY, WARN, Drivable, IntRange, BoolType
 from frappy.lib import parse_host_port
 from frappy.errors import CommunicationFailedError
 from mecom import MeComTcp
@@ -57,7 +57,7 @@ class MeComIO(Communicator):
     
     identification = [('100', '1161')]  # MeCom sends '1161' on connect, and the reply is checked to match the regexp '1161'
     default_settings = {'port': 50000, 'baudrate': 57600}
-    min_request_interval = 0.05  # MeCom requires a wait time of 50 ms between commands
+    min_request_interval = 0.02  # MeCom requires a wait time of 50 ms between commands
 
     def initModule(self):
         super().initModule()
@@ -134,12 +134,56 @@ class TECDrivable(Drivable, TECBase):
     pass
 
 
+class TECPID(TECBase):
+    p = Parameter('Proportional gain', datatype=FloatRange(), default=200, readonly=True)
+    i = Parameter('Integral gain', datatype=FloatRange(), default=1, readonly=True)
+    d = Parameter('Derivative gain', datatype=FloatRange(), default=0.25, readonly=True)
+    dPT1 = Parameter('Derivative PT1', datatype=FloatRange(), default=0.3, readonly=True)
+
+    def read_value(self):
+        self.p = self.io.communicate(3010, self.address, self.channel)
+        self.i = self.io.communicate(3011, self.address, self.channel)
+        self.d = self.io.communicate(3012, self.address, self.channel)
+        self.dPT1 = self.io.communicate(3013, self.address, self.channel)
+        return self.p, self.i, self.d, self.dPT1
+
+#    def write_p(self, value):
+#        self.io.set(3010, self.address, self.channel, value)
+#        return value
+
+#    def write_i(self, value):
+#        self.io.set(3011, self.address, self.channel, value)
+#        return value
+
+#    def write_d(self, value):
+#        self.io.set(3012, self.address, self.channel, value)
+#        return value
+
+    
+class TECPower(TECBase):
+    value = Parameter('TEC power', datatype=FloatRange(0, 120, unit='W'), readonly=True)
+    voltage = Parameter('TEC voltage', datatype=FloatRange(0, 20, unit='V'), readonly=False)
+    current = Parameter('TEC current', datatype=FloatRange(0, 6, unit='A'), readonly=False)
+
+    def read_value(self):
+        return (
+            self.read_voltage() * self.read_current()
+        )
+
+    def read_voltage(self):
+        return self.io.communicate(1021, self.address, self.channel)
+
+    def read_current(self):
+        return self.io.communicate(1020, self.address, self.channel)
+
+
 class SamplePosition(TECDrivable):
-    value = Parameter('Sample temperature', datatype=FloatRange(-100, 100, unit='C'))
-    target = Parameter('Target temperature', datatype=FloatRange(-100, 100, unit='C'))
-    setpoint = Parameter('Temperature setpoint', datatype=FloatRange(-100, 100, unit='C'))
-    output_enabled = Parameter('Output enabled?', datatype=BoolType(), default=False)
+    value = Parameter('Sample temperature', datatype=FloatRange(-45, 150, unit='C'))
+    target = Parameter('Target temperature', datatype=FloatRange(-45, 150, unit='C'))
+    setpoint = Parameter('Temperature setpoint', datatype=FloatRange(-45, 150, unit='C'))
+    output_enabled = Parameter('Output enabled?', datatype=BoolType(), default=False, readonly=False)
     tolerance = Parameter('convergence criterion', FloatRange(0), default=0.1, readonly=False)
+    pollinterval = Parameter('default poll interval', FloatRange(0.1, 120, unit='s'), default=3, readonly=False, export=True)
     _driving = False
 
     def read_value(self):
