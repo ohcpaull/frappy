@@ -31,7 +31,7 @@ class PfeifferProtocol(StringIO):
 
 class PfeifferMixin(HasIO): 
     ioClass = PfeifferProtocol    
-    address= Property('Addresse', datatype= IntRange())
+    address= Property('Address', datatype= IntRange())
 
     def data_request_u_expo_new(self, parameter_nr):
         reply = self.communicate(f'{self.address:03d}00{parameter_nr:03d}02=?')
@@ -141,6 +141,7 @@ class RPT200(PfeifferMixin, Readable):
         else: 
             return ERROR, errtxt
 
+
 class CPT200(PfeifferMixin, Readable):
     value= Parameter('Pressure', FloatRange(unit='mbar'))
 
@@ -153,6 +154,7 @@ class CPT200(PfeifferMixin, Readable):
             return IDLE, ''
         else: 
             return ERROR, errtxt
+
 
 class TCP400(PfeifferMixin, Drivable, Readable):
     speed= Parameter('Rotational speed', FloatRange(unit='Hz'), readonly = False)
