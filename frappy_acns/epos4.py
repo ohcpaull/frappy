@@ -196,6 +196,9 @@ _U16 = dict(datatype=datatypes.UInt16,
 _I32 = dict(datatype=datatypes.Int32, length=2,
             encode=ModbusIO.i32_to_registers,
             decode=ModbusIO.registers_to_i32)
+_U8 = dict(datatype=datatypes.UInt8, length=1,
+            encode=ModbusIO.u8_to_registers,
+            decode=ModbusIO.registers_to_u8)
 
 TAG_MAP = {
     # --- input registers (read) ---
@@ -203,7 +206,7 @@ TAG_MAP = {
     "read_control_word": RegisterDef(address=1, tag="Controlword", **_U16),
     "read_error_code": RegisterDef(address=2, tag="Error_code", **_U16),
     "read_mode_of_operation": RegisterDef(
-        address=3, tag="Modes_of_operation_display", **_U16),
+        address=3, tag="Modes_of_operation_display", **_U8),
     "read_position_value": RegisterDef(
         address=4, tag="Position_actual_value", **_I32),
     "read_position_demand": RegisterDef(
@@ -250,7 +253,7 @@ class EPOS4Base(HasIO, Readable):
         datatype=IntRange(0, 0xFFFF), default=0)
     counts_per_turn = Property(
         'encoder increments per revolution of the output shaft',
-        datatype=FloatRange(1), default=4096.0)
+        datatype=FloatRange(), default=4096.0)
     velocity_scale = Property(
         'rpm per raw velocity unit reported by the drive',
         datatype=FloatRange(0), default=1.0)
@@ -270,13 +273,18 @@ class EPOS4Base(HasIO, Readable):
     statusword = Parameter('raw CiA-402 statusword', IntRange(0, 0xFFFF),
                            readonly=True, default=0, group='drive',
                            visibility='expert')
-    mode_display = Parameter('active mode of operation', IntRange(-128, 127),
+    mode_display = Parameter('active mode of operation', IntRange(0, 11),
                              readonly=True, default=0, group='drive',
                              visibility='expert')
     position = Parameter('shaft position', FloatRange(unit='deg'),
                          readonly=True, default=0)
     velocity = Parameter('actual rotation speed', FloatRange(unit='rpm'),
                          readonly=True, default=0)
+    velocity_demand = Parameter(
+        'speed demanded by the profile generator - if this does not follow '
+        'target, the ramp is not running (check mode, profile acceleration '
+        'and max profile velocity)',
+        FloatRange(unit='rpm'), readonly=True, default=0, group='drive')
     current = Parameter('averaged motor current', FloatRange(unit='mA'),
                         readonly=True, default=0, group='diagnostics',
                         visibility='expert')
@@ -284,13 +292,14 @@ class EPOS4Base(HasIO, Readable):
                        FloatRange(unit='permille'), readonly=True, default=0,
                        group='diagnostics', visibility='expert')
 
+    _last_cw = None        # last controlword written, for readback checks
     _fields = None         # last decoded {tag key: raw value}
     _fields_ts = 0.0       # monotonic timestamp of that block
     _fields_max_age = 1.5  # only guards ad-hoc reads, never the poll path
 
     # -- unit conversion ---------------------------------------------------
     def _raw_to_deg(self, raw):
-        return raw * 360.0 / self.counts_per_turn
+        return raw * 360.0 / (self.counts_per_turn * 130) % 360
 
     def _raw_to_rpm(self, raw):
         return raw * self.velocity_scale
@@ -331,6 +340,11 @@ class EPOS4Base(HasIO, Readable):
     def _write(self, key, value):
         return self.io.set(TAG_MAP[key], value, offset=self.holding_offset)
 
+    def _write_controlword(self, cw):
+        """Write the controlword, remembering it so a readback can be checked."""
+        self._last_cw = int(cw)
+        return self._write('write_control_word', int(cw))
+
     # -- polling -----------------------------------------------------------
     def doPoll(self):
         """Refresh every published parameter from one Modbus transaction."""
@@ -340,9 +354,10 @@ class EPOS4Base(HasIO, Readable):
         self.statusword = sw
         self.drive_state = int(state)
         self.error_code = fields['read_error_code']
-        self.mode_display = fields['read_mode_of_operation'] & 0xFF
+        self.mode_display = fields['read_mode_of_operation'] # & 0xFF
         self.position = self._raw_to_deg(fields['read_position_value'])
         self.velocity = self._raw_to_rpm(fields['read_velocity_value'])
+        self.velocity_demand = self._raw_to_rpm(fields['read_velocity_demand'])
         self.current = float(fields['read_current_value'])
         self.torque = fields['read_torque_value'] / 1000.0
         self.value = self.velocity
@@ -368,6 +383,10 @@ class EPOS4Base(HasIO, Readable):
     @nopoll
     def read_error_code(self):
         return self._field('read_error_code')
+
+    @nopoll
+    def read_velocity_demand(self):
+        return self._raw_to_rpm(self._field('read_velocity_demand'))
 
     @nopoll
     def read_mode_display(self):
@@ -418,6 +437,10 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
     speed_tolerance = Parameter('speed deviation still counted as on target',
                                 FloatRange(0, unit='rpm'), default=2.0,
                                 readonly=False, group='tuning')
+    halt_toggle = Parameter(
+        'pulse the halt bit before Enable Operation when latching a new target,'
+        ' so gateways that only forward changed registers still see an edge',
+        datatypes.BoolType(), default=True, readonly=False, group='tuning')
 
     _blocking_fault = None
 
@@ -427,6 +450,7 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
             raise HardwareError(
                 f'{self._blocking_fault} - run reset_fault first')
         self.start_machine(self.enabling, target=value)
+        self._latch_setpoint()
         return value
 
     @status_code(300, 'enabling drive')  # 300 == BUSY
@@ -439,23 +463,83 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
             sm.deadline = sm.now + self.enable_timeout
         sw = self._drv('read_status_word')
         if StatusControl.is_enabled(sw):
+            # 0x60FF is only the active set-point while PVM is the running
+            # mode; in any other mode the drive sits enabled and still, with
+            # velocity_demand stuck away from target. Re-assert rather than
+            # assume the write at sm.init landed.
+            mode = self._drv('read_mode_of_operation') & 0xFF
+            if mode != OperatingMode.PROFILE_VELOCITY:
+                self._write('write_mode_of_operation',
+                            int(OperatingMode.PROFILE_VELOCITY))
+                if sm.now > sm.deadline:
+                    raise HardwareError(
+                        f'drive is enabled but stayed in mode {mode} instead of '
+                        f'{int(OperatingMode.PROFILE_VELOCITY)} (profile '
+                        f'velocity) - target velocity will be ignored. Check '
+                        f'that write_mode_of_operation is mapped correctly.')
+                return Retry
             return self.ramp_to_speed
         cw = StatusControl.next_controlword(sw)
         if cw is not None:
-            self._write('write_control_word', int(cw))
+            self._write_controlword(cw)
         if sm.now > sm.deadline:
             _, state = StatusControl.get_state(sw)
             raise HardwareError(
-                f'drive did not enable, stuck in '
-                f'{DRIVE_STATE_TEXT[state]!r} (statusword 0x{sw:04X})')
+                f'drive did not enable, stuck in {DRIVE_STATE_TEXT[state]!r} '
+                f'after {self.enable_timeout:g} s. {self._enable_diagnosis(sw)}')
         return Retry
+
+    def _enable_diagnosis(self, sw):
+        """Say which half of the chain is at fault when enabling times out.
+
+        The controlword is mapped for reading as well, so comparing what we
+        wrote against what the drive reports separates 'the write never
+        arrived' from 'the drive refuses to move'.
+        """
+        err = self._drv('read_error_code')
+        mode = self._drv('read_mode_of_operation') & 0xFF
+        try:
+            readback = self._drv('read_control_word')
+        except KeyError:
+            readback = None
+        detail = (f'statusword 0x{sw:04X}, error 0x{err:04X}, mode {mode}, '
+                  f'last controlword written '
+                  f'0x{(self._last_cw or 0):04X}')
+        if readback is None:
+            return detail + ' (no controlword readback mapped)'
+        detail += f', controlword read back 0x{readback:04X}'
+        if self._last_cw is not None and readback != self._last_cw:
+            return (detail + ' -> READBACK MISMATCH: the write is not reaching '
+                    'the drive. Check holding_offset and the gateway write '
+                    'mapping, and try use_fc06 on the io module.')
+        return (detail + ' -> the controlword arrived but the drive will not '
+                'leave this state. Check STO/enable wiring, motor supply '
+                'voltage, and the error code above.')
+
+    def _latch_setpoint(self):
+        """Make the drive act on the target velocity just written.
+
+        The EPOS4 picks up a new PVM set-point when a controlword arrives, not
+        when 0x60FF is written - so a target on its own leaves the profile
+        generator idle and velocity_demand pinned. Re-sending Enable Operation
+        is what starts it.
+
+        The controlword usually already holds 0x000F at this point, and a
+        gateway that only forwards an SDO when the mapped register *changes*
+        would swallow a plain repeat. Toggling the halt bit guarantees the
+        drive sees a real transition. Set `halt_toggle = False` if your gateway
+        forwards every write and you would rather avoid the momentary halt.
+        """
+        if self.halt_toggle:
+            self._write_controlword(ControlWord.ENABLE_OPERATION_HALT)
+        self._write_controlword(ControlWord.ENABLE_OPERATION)
 
     @status_code(300, 'ramping to speed')
     def ramp_to_speed(self, sm):
         if sm.init:
             self._write('write_target_velocity', self._rpm_to_raw(sm.target))
-            # clear the halt bit so the profile generator runs
-            self._write('write_control_word', int(ControlWord.ENABLE_OPERATION))
+            # target first, then the controlword that latches it
+            self._latch_setpoint()
             sm.deadline = sm.now + self.ramp_timeout
             # The statusword we hold was read before the new set-point was
             # written, so its TARGET_REACHED bit still refers to the previous
@@ -483,8 +567,7 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
     @status_code(300, 'stopping')
     def stopping(self, sm):
         if sm.init:
-            self._write('write_control_word',
-                        int(ControlWord.ENABLE_OPERATION_HALT))
+            self._write_controlword(ControlWord.ENABLE_OPERATION_HALT)
             sm.deadline = sm.now + self.stop_timeout
             # as in ramp_to_speed: the statusword in hand predates the halt
             return Retry
@@ -503,11 +586,26 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
         self.target = 0
         self.start_machine(self.stopping, target=0)
 
+    @Command(IntRange(0, 0xFFFF), result=IntRange(0, 0xFFFF),
+             visibility='expert')
+    def raw_controlword(self, value):
+        """Write a raw controlword and return the drive's readback.
+
+        For bench-testing the gateway's write mapping without the state
+        machine: step 0x06 -> 0x07 -> 0x0F by hand and watch `statusword`
+        move 0x0040 -> 0x0021 -> 0x0023 -> 0x0027. If the returned readback
+        does not match what you wrote, the write is not reaching the drive.
+        """
+        self._write_controlword(value)
+        self._refresh_fields()
+        self.read_status()
+        return self._drv('read_control_word')
+
     @Command
     def reset_fault(self):
         """Acknowledge a drive fault (rising edge of controlword bit 7)."""
-        self._write('write_control_word', StatusControl.disable_word())
-        self._write('write_control_word', StatusControl.fault_reset_word())
+        self._write_controlword(StatusControl.disable_word())
+        self._write_controlword(StatusControl.fault_reset_word())
         self._blocking_fault = None
         self._refresh_fields()
         self.read_status()
@@ -516,7 +614,7 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
         reason = repr(sm.cleanup_reason)
         self._blocking_fault = reason
         try:
-            self._write('write_control_word', StatusControl.disable_word())
+            self._write_controlword(StatusControl.disable_word())
         except Exception as e:
             self.log.warning('could not disable drive after error: %r', e)
         return super().on_error(sm)
