@@ -74,6 +74,8 @@ class ModbusIO(Communicator):
                    """, datatype=StringType())
     pollinterval = Property('reconnect/poll interval', datatypes.FloatRange(0.1, 120),
                             default=1)
+    use_fc06 = Property('write single registers with FC06 rather than FC16',
+                        datatypes.BoolType(), default=True)
 
     _conn = None
     _lock = None
@@ -102,6 +104,14 @@ class ModbusIO(Communicator):
         # and command handlers run on different threads, so every transaction is
         # serialised through this lock.
         self._lock = Lock()
+
+    @staticmethod
+    def registers_to_u8(reg):
+        return reg[0] >> 8
+
+    @staticmethod
+    def u8_to_registers(value):
+        return value << 8
 
     @staticmethod
     def registers_to_u16(reg):
@@ -197,9 +207,14 @@ class ModbusIO(Communicator):
         :param offset: base address of the device's window in the register map
         """
         address = register.address + offset
+        values = register.encode(data)
         with self._lock:
-            ok = self._conn.write_multiple_registers(
-                address, register.encode(data))
+            if len(values) == 1 and self.use_fc06:
+                # many gateways implement FC06 for a single register and either
+                # reject or quietly ignore an FC16 with a count of one
+                ok = self._conn.write_single_register(address, values[0])
+            else:
+                ok = self._conn.write_multiple_registers(address, values)
         if not ok:
             raise CommunicationFailedError(
                 f"modbus write to {register.tag} @{address} failed: "

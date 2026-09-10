@@ -3,6 +3,7 @@ log/*
 html/*
 *.pyc
 pid/*
+cfg/*
 
 # ide
 .idea
