@@ -37,13 +37,35 @@ class TemperatureSetpoint(HasIO, Readable):
     """ A temperature setpoint (generic for different models)"""
     ioClass = LakeshoreIO
 
-    output = Property('the Lakeshore heater output', datatype=IntRange(1,2), default=1)
+    output = Property('the Lakeshore heater output channel', datatype=IntRange(1,2), default=1)
     setpoint = Parameter('the setpoint temperature', datatype=FloatRange(0,1500, unit='K'))
 
     def read_setpoint(self):
         reply = self.communicate(f'SETP?{self.output}')
         return float(reply)
 
+
+class Heater(HasIO, Readable):
+
+    ioClass = LakeshoreIO
+    output = Property('the Lakeshore heater output channel', datatype=IntRange(1,2), default=1)
+    # 'value' is the Readable parameter, not a Property (it is read from the hardware)
+    value = Parameter('the Lakeshore heater power in percent',
+                      datatype=FloatRange(min=0, max=100, unit='%'))
+
+    def read_value(self):
+        reply = self.communicate(f'HTR? {self.output}')
+        return float(reply)
+
+    def read_status(self):
+        reply = int(float(self.communicate(f'HTRST? {self.output}')))
+
+        if reply == 1:
+            return ERROR, "Heater open load"
+        elif reply == 2:
+            return ERROR, "Heater short"
+        else:
+            return IDLE, "No error"
 
 
 class TemperatureSensor(HasIO, Readable):
