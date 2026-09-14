@@ -63,9 +63,16 @@ fast_slow = Mapped(ON=0, OFF=1)  # maps OIs slow=ON/fast=OFF to sample_rate.slow
 
 class IO(StringIO):
     identification = [('*IDN?', r'IDN:OXFORD INSTRUMENTS:*')]
+    timeout = 5
+    encoding = 'latin1'
+
+    @Command(StringType(isUTF8=True), result=StringType(isUTF8=True))
+    def communicate(self, cmd, noreply=False):
+        return super().communicate(cmd, noreply)
 
 
 class MercuryChannel(HasIO):
+    ioClass = IO
     slot = Property('comma separated slot id(s), e.g. DB6.T1', StringType())
     kind = ''  #: used slot kind(s)
     slots = ()  #: dict[<kind>] of <slot>
@@ -98,7 +105,7 @@ class MercuryChannel(HasIO):
         :param names: the SCPI names of the parameter(s), for example ['TEMP']
         :param convert: a converter function (converts replied string to value)
         :return:  the values as tuple
-
+query
         Example (kind=PRES,AUX slot=DB5.P1,DB3.G1):
             adr='DEV::AUX:SIG'
             names = ('PERC',)
@@ -210,6 +217,14 @@ class TemperatureSensor(MercuryChannel, Readable):
         return self.query('DEV::TEMP:SIG:RES')
 
 
+class RawSensor(MercuryChannel, Readable):
+    kind = 'TEMP'
+    value = Parameter(unit='Ohm')
+
+    def read_value(self):
+        return self.query('DEV::TEMP:SIG:RES')
+
+
 class HasInput(HasControlledBy, MercuryChannel):
     pass
 
@@ -293,6 +308,7 @@ class HeaterOutput(HasInput, Writable):
     volt = 0.0  # target voltage
     _last_target = None
     _volt_target = None
+    _resistivity = 10
 
     def read_limit(self):
         return self.query('DEV::HTR:VLIM') ** 2 / self.resistivity
@@ -311,7 +327,7 @@ class HeaterOutput(HasInput, Writable):
         if self._last_target is not None:
             if not self.true_power:
                 self._volt_target = math.sqrt(self._last_target * self.resistivity)
-            self.change('DEV::HTR:SIG:VOLT', self._volt_target, tolerance=2e-4)
+            self.change('DEV::HTR:SIG:VOLT', self._volt_target, n_retry=0)
         return self.resistivity
 
     def read_status(self):
@@ -328,10 +344,15 @@ class HeaterOutput(HasInput, Writable):
             res = volt / current
             tol = res * max(max(0.0003, abs(volt - self._volt_target)) / volt, 0.0001 / current, 0.0001)
             if abs(res - self.resistivity) > tol + 0.07 and self._last_target:
-                self.write_resistivity(round(res, 1))
-                if self.controlled_by == 0:
-                    self._volt_target = math.sqrt(self._last_target * self.resistivity)
-                    self.change('DEV::HTR:SIG:VOLT', self._volt_target, tolerance=2e-4)
+                res = round(res, 1)
+                if self._resistivity != res and 10 <= res <= 100:
+                    # we want twice the same value before changing
+                    self._resistivity = res
+                else:
+                    self.write_resistivity(res)
+                    if self.controlled_by == 0:
+                        self._volt_target = math.sqrt(self._last_target * self.resistivity)
+                        self.change('DEV::HTR:SIG:VOLT', self._volt_target, n_retry=0)
         return volt * current
 
     def read_target(self):
@@ -349,13 +370,23 @@ class HeaterOutput(HasInput, Writable):
         might be used by a software loop
         """
         self._volt_target = math.sqrt(target * self.resistivity)
-        self.change('DEV::HTR:SIG:VOLT', self._volt_target, tolerance=2e-4)
+        self.change('DEV::HTR:SIG:VOLT', self._volt_target, n_retry=0)
         self._last_target = target
         return target
 
     def write_target(self, value):
         self.self_controlled()
         return self.set_target(value)
+
+
+class HeaterUpdate(HeaterOutput):
+    kind = 'HTR,TEMP'
+    target = 0  # switch off loop on startup
+
+    def update_target(self, module, value):
+        self.change(f'DEV::TEMP:LOOP:ENAB', False, off_on)
+        super().update_target(module, value)
+        self.set_target(value)
 
 
 class TemperatureLoop(TemperatureSensor, ConvLoop):
