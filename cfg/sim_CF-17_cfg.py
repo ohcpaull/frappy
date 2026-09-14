@@ -11,7 +11,8 @@ from os import environ
 
 Node('ls336.platypus.acns.sim',
      'simulated CF-17 cryostat (LakeShore 336 + Pfeiffer TPG)',
-     interface='tcp://' + environ.get('SIM_SECOP_PORT', '10767'))
+     interface='tcp://' + environ.get('SIM_SECOP_PORT', '10767'),
+     secondary=['ws://10768'])
 
 Mod('io',
     'frappy_acns.lakeshore_sim.Ls336Sim',
