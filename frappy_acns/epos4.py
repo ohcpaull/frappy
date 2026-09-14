@@ -25,15 +25,26 @@ registers. Addresses in :data:`TAG_MAP` are *relative* to that window, so
 several drives behind one gateway share the table and are told apart by the
 ``input_offset`` / ``holding_offset`` properties of each module.
 
-Layering: :mod:`frappy_acns.modbusTCP` is the transport, this module is the
-device family, and instrument-specific modules (e.g.
-:mod:`frappy_acns.tumbler`) subclass :class:`EPOS4Motion`.
+Layering:
+
+- :mod:`frappy_acns.modbusTCP` is the transport.
+- :class:`EPOS4Base` is the register windowing, block read and CiA-402 status
+  decoding shared by every EPOS4, regardless of how it is driven.
+- :class:`EPOS4Motion` adds the CiA-402 enable/disable/fault state machine
+  that is likewise shared, parameterised by ``OPERATING_MODE``.
+- :class:`EPOS4Velocity` and :class:`EPOS4Position` are the two concrete
+  motion profiles currently supported: continuous rotation commanded through
+  an analog output voltage (Cyclic Synchronous Velocity), and point-to-point
+  moves (Profile Position Mode). Configure a device with whichever one
+  matches how that axis is wired and used.
+- Instrument-specific modules (e.g. :mod:`frappy_acns.tumbler`) subclass
+  whichever of the two matches the axis, adding only labels/limits.
 """
 
 import time
 from enum import IntEnum, IntFlag
 
-from frappy.core import Command, Drivable, EnumType, FloatRange, HasIO, \
+from frappy.core import BUSY, Command, Drivable, EnumType, FloatRange, HasIO, \
     IntRange, Parameter, Property, Readable, nopoll, IDLE, WARN, ERROR
 from frappy.errors import HardwareError
 from frappy.states import HasStates, Retry, status_code
@@ -59,6 +70,10 @@ class StatusWord(IntFlag):
     REMOTE = 0x0200
     TARGET_REACHED = 0x0400
     INTERNAL_LIMIT = 0x0800
+    # bit 12: meaning is mode-dependent - 'set-point acknowledged' in Profile
+    # Position Mode (what we use it for), 'homing attained' in Homing mode,
+    # 'drive follows the command value' in CSP/CSV.
+    SETPOINT_ACK = 0x1000
 
 
 class ControlWord(IntEnum):
@@ -79,9 +94,12 @@ class ControlWord(IntEnum):
 
 class OperatingMode(IntEnum):
     """Modes of operation (object 0x6060)."""
+    NO_MODE = 0            # what mode_display reads before anything is set
     PROFILE_POSITION = 1   # PPM
     PROFILE_VELOCITY = 3   # PVM
-    HOMING = 6             # HMM
+    HOMING = 6              # HMM
+    CYCLIC_SYNC_POSITION = 8   # CSP
+    CYCLIC_SYNC_VELOCITY = 9   # CSV
 
 
 class DriveState(IntEnum):
@@ -116,7 +134,14 @@ DRIVE_STATE_ENUM = EnumType('drivestate',
 
 
 class StatusControl:
-    """Decodes CiA-402 statuswords and produces the controlwords to answer them."""
+    """Decodes CiA-402 statuswords and produces the controlwords to answer them.
+
+    This class only knows the CiA-402 state machine itself - it has no opinion
+    on *when* it is safe to send a recovery controlword (e.g. whether leaving
+    quick stop automatically is acceptable). That policy lives on
+    :class:`EPOS4Motion` (``resume_from_quickstop``), one level up, because it
+    depends on how a given axis is wired, not on the protocol.
+    """
 
     # (mask, pattern, secop status code, drive state), first match wins
     _STATE_TABLE = (
@@ -160,16 +185,21 @@ class StatusControl:
     }
 
     @staticmethod
-    def next_controlword(sw: int):
+    def next_controlword(sw: int, resume_from_quickstop=True):
         """Controlword to send next to progress toward 'operation enabled'.
 
-        Returns None when already enabled, or while the drive is still
-        powering up / decelerating on a fault and we should just wait. Send
-        the word, re-read the statusword, call again - one transition per call.
+        Returns None when already enabled, when the drive is still powering up
+        (NOT_READY) or reacting to a fault (nothing to send until that settles),
+        or when it is in quick stop and `resume_from_quickstop` is False - the
+        caller has decided leaving quick stop is not this driver's decision to
+        make (see :class:`EPOS4Motion`). Otherwise send the word, re-read the
+        statusword, call again - one transition per call.
         """
         _, state = StatusControl.get_state(sw)
         if state in (DriveState.OPERATION_ENABLED, DriveState.NOT_READY,
                      DriveState.FAULT_REACTION_ACTIVE):
+            return None
+        if state == DriveState.QUICK_STOP_ACTIVE and not resume_from_quickstop:
             return None
         return StatusControl._ENABLE_STEP.get(state, ControlWord.SHUTDOWN)
 
@@ -228,6 +258,8 @@ TAG_MAP = {
         address=2, tag="Target_position", writable=True, **_I32),
     "write_target_velocity": RegisterDef(
         address=4, tag="Target_velocity", writable=True, **_I32),
+    "write_target_voltage": RegisterDef(
+        address=6, tag="Analog_output_general_purpose_A", writable=True, **_I32),
 }
 
 
@@ -239,7 +271,8 @@ class EPOS4Base(HasIO, Readable):
     """Everything common to an EPOS4 drive reached through a Modbus gateway.
 
     Holds the register windowing, the single-transaction block read and the
-    CiA-402 status decoding. Subclass and add motion behaviour.
+    CiA-402 status decoding. On its own this is a read-only diagnostics module;
+    subclass :class:`EPOS4Motion` to command the drive.
     """
     ioClass = ModbusIO
 
@@ -252,8 +285,12 @@ class EPOS4Base(HasIO, Readable):
         "base address of this drive's holding-register (write) window",
         datatype=IntRange(0, 0xFFFF), default=0)
     counts_per_turn = Property(
-        'encoder increments per revolution of the output shaft',
+        'encoder increments per revolution of the MOTOR/encoder shaft',
         datatype=FloatRange(), default=4096.0)
+    gear_ratio = Property(
+        'output-shaft turns per motor turn (>1 for a reduction gearbox); '
+        'encoder counts per OUTPUT-shaft turn = counts_per_turn * gear_ratio',
+        datatype=FloatRange(), default=1.0)
     velocity_scale = Property(
         'rpm per raw velocity unit reported by the drive',
         datatype=FloatRange(0), default=1.0)
@@ -265,7 +302,9 @@ class EPOS4Base(HasIO, Readable):
     _BLOCK_LEN = max(TAG_MAP[k].address + TAG_MAP[k].length
                      for k in _READ_KEYS) - _BLOCK_START
 
-    value = Parameter('actual rotation speed', FloatRange(unit='rpm'))
+    value = Parameter('primary measured value - meaning depends on the motion '
+                      'profile in use (see the concrete subclass)',
+                      FloatRange(unit='rpm'))
     drive_state = Parameter('CiA-402 state of the drive', DRIVE_STATE_ENUM,
                             readonly=True, default=0, group='drive')
     error_code = Parameter('EPOS4 error code', IntRange(0, 0xFFFF),
@@ -273,10 +312,10 @@ class EPOS4Base(HasIO, Readable):
     statusword = Parameter('raw CiA-402 statusword', IntRange(0, 0xFFFF),
                            readonly=True, default=0, group='drive',
                            visibility='expert')
-    mode_display = Parameter('active mode of operation', IntRange(0, 11),
-                             readonly=True, default=0, group='drive',
-                             visibility='expert')
-    position = Parameter('shaft position', FloatRange(unit='deg'),
+    mode_display = Parameter('active mode of operation (see OperatingMode)',
+                             IntRange(0, 11), readonly=True, default=0,
+                             group='drive', visibility='expert')
+    position = Parameter('shaft position, wrapped to one turn', FloatRange(unit='deg'),
                          readonly=True, default=0)
     velocity = Parameter('actual rotation speed', FloatRange(unit='rpm'),
                          readonly=True, default=0)
@@ -299,7 +338,13 @@ class EPOS4Base(HasIO, Readable):
 
     # -- unit conversion ---------------------------------------------------
     def _raw_to_deg(self, raw):
-        return raw * 360.0 / (self.counts_per_turn * 130) % 360
+        return raw * 360.0 / (self.counts_per_turn * self.gear_ratio) % 360
+
+    def _deg_to_raw(self, deg):
+        """Inverse of :meth:`_raw_to_deg`, WITHOUT the wrap - a position target
+        is an absolute encoder count, not a display value, so a target of
+        e.g. 370 deg is a real, valid, more-than-one-turn destination."""
+        return int(round(deg / 360.0 * self.counts_per_turn * self.gear_ratio))
 
     def _raw_to_rpm(self, raw):
         return raw * self.velocity_scale
@@ -354,19 +399,28 @@ class EPOS4Base(HasIO, Readable):
         self.statusword = sw
         self.drive_state = int(state)
         self.error_code = fields['read_error_code']
-        self.mode_display = fields['read_mode_of_operation'] # & 0xFF
+        self.mode_display = fields['read_mode_of_operation']
         self.position = self._raw_to_deg(fields['read_position_value'])
         self.velocity = self._raw_to_rpm(fields['read_velocity_value'])
         self.velocity_demand = self._raw_to_rpm(fields['read_velocity_demand'])
         self.current = float(fields['read_current_value'])
         self.torque = fields['read_torque_value'] / 1000.0
-        self.value = self.velocity
+        self._update_value()
         self.read_status()
+
+    def _update_value(self):
+        """Which measurement ``value`` mirrors. Default: rotation speed.
+
+        Overridden by :class:`EPOS4Position` (position instead).
+        """
+        self.value = self.velocity
 
     # -- on-demand readers (the poll path is doPoll, so none of these poll) --
     @nopoll
     def read_value(self):
-        return self._raw_to_rpm(self._field('read_velocity_value'))
+        """Default: value mirrors rotation speed - overridden by
+        EPOS4Position, whose value mirrors position instead."""
+        return self.read_velocity()
 
     @nopoll
     def read_velocity(self):
@@ -415,32 +469,47 @@ class EPOS4Base(HasIO, Readable):
 
 
 class EPOS4Motion(HasStates, Drivable, EPOS4Base):
-    """An EPOS4 running in Profile Velocity Mode: continuous rotation.
+    """Shared CiA-402 enable/disable/fault handling for a driven EPOS4 axis.
 
-    ``target`` is the commanded shaft speed. Writing it runs a non-blocking
-    CiA-402 state machine that enables the power stage one transition per poll
-    cycle and then ramps to speed; ``status`` is BUSY until the drive reports
-    target reached.
+    Not used directly - subclass and set ``OPERATING_MODE`` plus a ``running``
+    state function. See :class:`EPOS4Velocity` and :class:`EPOS4Position`.
+
+    ``write_target`` runs a non-blocking state machine: :meth:`enabling` walks
+    the drive to 'operation enabled' in ``OPERATING_MODE``, one CiA-402
+    controlword transition per poll cycle, then hands off to the subclass's
+    ``running`` state. ``status`` is BUSY throughout, IDLE once ``running``
+    calls :meth:`~frappy.states.HasStates.final_status`, and WARN whenever the
+    drive itself is not actually enabled - regardless of what the state
+    machine last finished at (see :meth:`read_status`).
     """
-    target = Parameter('commanded rotation speed', FloatRange(unit='rpm'),
-                       readonly=False, default=0)
+    #: (int) object 0x6060 value this class puts the drive into. Set by
+    #: subclasses; EPOS4Motion itself is not a complete, instantiable module.
+    OPERATING_MODE = None
 
-    enable_timeout = Parameter('timeout for the CiA-402 enable sequence',
+    #: Whether the enable sequence is allowed to send ENABLE_OPERATION to move
+    #: the drive out of Quick Stop Active on its own. Default False: quick
+    #: stop is treated as an externally-imposed condition (e.g. a safety
+    #: interlock) that this driver must never talk the drive out of - only
+    #: hardware/an operator gets to end it. Set True in the module's config
+    #: only for an axis you have confirmed has no such interlock and where
+    #: automatic recovery from quick stop is actually wanted.
+    resume_from_quickstop = Property(
+        'allow the enable sequence to leave Quick Stop Active by sending '
+        'Enable Operation. Leave False for any axis with a safety interlock '
+        'wired through quick stop - see the class docstring.',
+        datatype=datatypes.BoolType(), default=False)
+
+    enable_timeout = Parameter('timeout for the CiA-402 enable sequence '
+                               '(irrelevant while waiting out quick stop - '
+                               'see resume_from_quickstop)',
                                FloatRange(0, unit='s'), default=3.0,
                                readonly=False, group='tuning')
-    ramp_timeout = Parameter('timeout for reaching the commanded speed',
-                             FloatRange(0, unit='s'), default=20.0,
-                             readonly=False, group='tuning')
-    stop_timeout = Parameter('timeout for coming to a standstill',
+    stop_timeout = Parameter('timeout for coming to a standstill after stop()',
                              FloatRange(0, unit='s'), default=10.0,
                              readonly=False, group='tuning')
-    speed_tolerance = Parameter('speed deviation still counted as on target',
-                                FloatRange(0, unit='rpm'), default=2.0,
-                                readonly=False, group='tuning')
-    halt_toggle = Parameter(
-        'pulse the halt bit before Enable Operation when latching a new target,'
-        ' so gateways that only forward changed registers still see an edge',
-        datatypes.BoolType(), default=True, readonly=False, group='tuning')
+    stop_speed_tolerance = Parameter(
+        'speed considered "stopped" for the purposes of stop()',
+        FloatRange(0, unit='rpm'), default=2.0, readonly=False, group='tuning')
 
     _blocking_fault = None
 
@@ -450,44 +519,60 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
             raise HardwareError(
                 f'{self._blocking_fault} - run reset_fault first')
         self.start_machine(self.enabling, target=value)
-        self._latch_setpoint()
         return value
 
-    @status_code(300, 'enabling drive')  # 300 == BUSY
+    @status_code(BUSY, 'enabling drive')
     def enabling(self, sm):
         if self._fields is None:
             return Retry  # no block read yet
         if sm.init:
-            self._write('write_mode_of_operation',
-                        int(OperatingMode.PROFILE_VELOCITY))
+            self._write('write_mode_of_operation', int(self.OPERATING_MODE))
             sm.deadline = sm.now + self.enable_timeout
         sw = self._drv('read_status_word')
+        _, state = StatusControl.get_state(sw)
+
+        if state == DriveState.QUICK_STOP_ACTIVE and not self.resume_from_quickstop:
+            # Waiting out an externally-imposed quick stop is not a timeout
+            # condition - keep pushing the deadline forward so this can sit
+            # here indefinitely without ever raising, and send nothing.
+            # Whatever cleared the interlock/quick-stop will move the drive to
+            # a different state on its own; normal enabling resumes from there
+            # next cycle, having sent zero controlwords in the meantime.
+            sm.deadline = sm.now + self.enable_timeout
+            return Retry
+
         if StatusControl.is_enabled(sw):
-            # 0x60FF is only the active set-point while PVM is the running
-            # mode; in any other mode the drive sits enabled and still, with
-            # velocity_demand stuck away from target. Re-assert rather than
-            # assume the write at sm.init landed.
             mode = self._drv('read_mode_of_operation') & 0xFF
-            if mode != OperatingMode.PROFILE_VELOCITY:
-                self._write('write_mode_of_operation',
-                            int(OperatingMode.PROFILE_VELOCITY))
+            if mode != self.OPERATING_MODE:
+                # The mode write at sm.init may not have landed (or something
+                # else changed it) - re-assert rather than assume.
+                self._write('write_mode_of_operation', int(self.OPERATING_MODE))
                 if sm.now > sm.deadline:
                     raise HardwareError(
-                        f'drive is enabled but stayed in mode {mode} instead of '
-                        f'{int(OperatingMode.PROFILE_VELOCITY)} (profile '
-                        f'velocity) - target velocity will be ignored. Check '
-                        f'that write_mode_of_operation is mapped correctly.')
+                        f'drive is enabled but stayed in mode {mode} instead '
+                        f'of {int(self.OPERATING_MODE)} - target will be '
+                        f'ignored. Check that write_mode_of_operation is '
+                        f'mapped correctly.')
                 return Retry
-            return self.ramp_to_speed
-        cw = StatusControl.next_controlword(sw)
+            return self.running
+        cw = StatusControl.next_controlword(
+            sw, resume_from_quickstop=self.resume_from_quickstop)
         if cw is not None:
             self._write_controlword(cw)
         if sm.now > sm.deadline:
-            _, state = StatusControl.get_state(sw)
             raise HardwareError(
                 f'drive did not enable, stuck in {DRIVE_STATE_TEXT[state]!r} '
                 f'after {self.enable_timeout:g} s. {self._enable_diagnosis(sw)}')
         return Retry
+
+    def running(self, sm):
+        """Entered once the drive is enabled and in ``OPERATING_MODE``.
+
+        Must be provided by a concrete subclass.
+        """
+        raise NotImplementedError(
+            f'{type(self).__name__} must implement running() - subclass '
+            f'EPOS4Velocity or EPOS4Position, not EPOS4Motion directly')
 
     def _enable_diagnosis(self, sw):
         """Say which half of the chain is at fault when enabling times out.
@@ -516,64 +601,18 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
                 'leave this state. Check STO/enable wiring, motor supply '
                 'voltage, and the error code above.')
 
-    def _latch_setpoint(self):
-        """Make the drive act on the target velocity just written.
-
-        The EPOS4 picks up a new PVM set-point when a controlword arrives, not
-        when 0x60FF is written - so a target on its own leaves the profile
-        generator idle and velocity_demand pinned. Re-sending Enable Operation
-        is what starts it.
-
-        The controlword usually already holds 0x000F at this point, and a
-        gateway that only forwards an SDO when the mapped register *changes*
-        would swallow a plain repeat. Toggling the halt bit guarantees the
-        drive sees a real transition. Set `halt_toggle = False` if your gateway
-        forwards every write and you would rather avoid the momentary halt.
-        """
-        if self.halt_toggle:
-            self._write_controlword(ControlWord.ENABLE_OPERATION_HALT)
-        self._write_controlword(ControlWord.ENABLE_OPERATION)
-
-    @status_code(300, 'ramping to speed')
-    def ramp_to_speed(self, sm):
-        if sm.init:
-            self._write('write_target_velocity', self._rpm_to_raw(sm.target))
-            # target first, then the controlword that latches it
-            self._latch_setpoint()
-            sm.deadline = sm.now + self.ramp_timeout
-            # The statusword we hold was read before the new set-point was
-            # written, so its TARGET_REACHED bit still refers to the previous
-            # target. Wait for a fresh one rather than believe it.
-            return Retry
-        sw = self._drv('read_status_word')
-        if StatusControl.is_fault(sw):
-            raise HardwareError(
-                f'drive faulted while ramping '
-                f'(error 0x{self._drv("read_error_code"):04X})')
-        if not StatusControl.is_enabled(sw):
-            return self.enabling  # dropped out, re-sequence
-        speed = self._raw_to_rpm(self._drv('read_velocity_value'))
-        if (sw & StatusWord.TARGET_REACHED
-                or abs(speed - sm.target) <= self.speed_tolerance):
-            if sm.target:
-                return self.final_status(IDLE, f'rotating at {sm.target:g} rpm')
-            return self.final_status(IDLE, 'stopped')
-        if sm.now > sm.deadline:
-            raise HardwareError(
-                f'did not reach {sm.target:g} rpm within {self.ramp_timeout:g} s '
-                f'(at {speed:g} rpm)')
-        return Retry
-
-    @status_code(300, 'stopping')
+    @status_code(BUSY, 'stopping')
     def stopping(self, sm):
         if sm.init:
             self._write_controlword(ControlWord.ENABLE_OPERATION_HALT)
             sm.deadline = sm.now + self.stop_timeout
-            # as in ramp_to_speed: the statusword in hand predates the halt
+            # the statusword we hold predates the halt write - wait for a
+            # fresh one rather than believe it
             return Retry
         sw = self._drv('read_status_word')
         speed = self._raw_to_rpm(self._drv('read_velocity_value'))
-        if sw & StatusWord.TARGET_REACHED or abs(speed) <= self.speed_tolerance:
+        if (sw & StatusWord.TARGET_REACHED
+                or abs(speed) <= self.stop_speed_tolerance):
             return self.final_status(IDLE, 'stopped')
         if sm.now > sm.deadline:
             return self.final_status(
@@ -582,7 +621,7 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
 
     @Command
     def stop(self):
-        """Ramp down to standstill, leaving the power stage enabled."""
+        """Halt (decelerate to standstill), leaving the power stage enabled."""
         self.target = 0
         self.start_machine(self.stopping, target=0)
 
@@ -621,7 +660,15 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
 
     # -- status ------------------------------------------------------------
     def read_status(self):
-        """Merge CiA-402 drive faults with the state machine's status."""
+        """Merge CiA-402 drive faults with the state machine's status.
+
+        This runs every poll regardless of whether the state machine is
+        actively doing anything, so it is what makes the driver reflect a
+        drive that has dropped out of 'operation enabled' (e.g. an interlock
+        engaging) as WARN immediately, and automatically go back to reporting
+        the machine's last IDLE status once the drive is enabled again - with
+        no further action from the state machine required either way.
+        """
         sw = self._field('read_status_word')
         code, state = StatusControl.get_state(sw)
         if code >= ERROR:
@@ -631,8 +678,260 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
             return code, self._blocking_fault
         if self._blocking_fault:
             return ERROR, f'{self._blocking_fault} - run reset_fault'
+        if state == DriveState.QUICK_STOP_ACTIVE and not self.resume_from_quickstop:
+            # Show this immediately and unconditionally, even while the state
+            # machine is busy in enabling() waiting it out (e.g. a client
+            # just wrote a new target): "BUSY enabling drive" would otherwise
+            # be shown for as long as the interlock is engaged, which reads as
+            # "something is actively happening" when the true, and important,
+            # state is "waiting for something outside Frappy's control".
+            return WARN, DRIVE_STATE_TEXT[state]
         machine = super().read_status()  # HasStates -> state machine status
         if machine[0] == IDLE and state != DriveState.OPERATION_ENABLED:
             # idle, but the drive is not actually under power
             return WARN, DRIVE_STATE_TEXT[state]
         return machine
+
+
+class EPOS4Velocity(EPOS4Motion):
+    """Continuous rotation commanded through an analog output voltage.
+
+    Why not simply write the CANopen velocity object (0x60FF) in Profile
+    Velocity Mode, as this driver originally did? PVM's profile generator only
+    picks up a new set-point when a controlword arrives (a rising edge on the
+    'new set-point' handshake, or - as this driver used to do it - a
+    re-assertion of Enable Operation); the write to 0x60FF alone does nothing.
+    That is fine on its own, but this axis also has a safety interlock, and
+    reacting to it by re-sending Enable Operation is exactly the kind of
+    "Frappy sends a controlword to restart motion" that must not happen here:
+    the interlock has to be able to stop AND release the drive purely through
+    its own wiring, with no software step in between.
+
+    So instead the drive runs in Cyclic Synchronous Velocity mode (0x6060 = 9)
+    and ``target`` is not written to 0x60FF at all - it is converted to a
+    voltage and written to one of the drive's analog outputs (object 0x3240,
+    "Analog output general purpose A" in this register map). That output is
+    wired externally to an analog input that the actual speed reference is
+    scaled from (my understanding, not yet confirmed against your wiring
+    diagram: this is the SAME EPOS4's own analog input, routed back in through
+    the interlock relay, and CSV is configured in EPOS Studio to take its
+    cyclic set-point from that analog value rather than from 0x60FF - please
+    correct me if that is wrong, since it does not change what this class
+    does, only how I have described why it works).
+
+    Because the analog output register is a plain, always-on value with no
+    "apply this" handshake, writing ``target`` is a one-shot register write,
+    done immediately and unconditionally, decoupled from the CiA-402 enable
+    state entirely - it happens whether or not the drive currently reports
+    'operation enabled'. The state machine's job is purely to get the drive
+    into CSV mode and confirm it is enabled; it never needs to, and never
+    does, re-touch the voltage once written.
+
+    ``resume_from_quickstop`` defaults to False (inherited from
+    :class:`EPOS4Motion`) for exactly the reason above. Do not override it to
+    True on an axis with this interlock.
+    """
+    OPERATING_MODE = OperatingMode.CYCLIC_SYNC_VELOCITY
+
+    # Bounds match the zero_speed_voltage/rpm_per_volt/output_voltage_*
+    # defaults just below: (2.3-1.0)*1000 = 1300 rpm. This is a genuine
+    # SECoP-level range check (a client sending outside it gets a clean
+    # RangeError) rather than the voltage-clamp in _rpm_to_voltage, which is
+    # only a defence against cfg drift once these numbers no longer agree - if
+    # you override the calibration Properties for a different axis, update
+    # this range to match, or a client can request a target that gets
+    # silently clamped to a different voltage than the reported rpm implies.
+    target = Parameter('commanded rotation speed', FloatRange(0, 1300, unit='rpm'),
+                       readonly=False, default=0)
+    value = Parameter('actual rotation speed', FloatRange(unit='rpm'))
+
+    zero_speed_voltage = Property(
+        'analog output voltage that commands 0 rpm', FloatRange(), default=1.0)
+    rpm_per_volt = Property(
+        "slope of the external speed scaling: rpm change per volt above "
+        "zero_speed_voltage. Default 1000.0 matches '1 V = 0 rpm, 2.3 V = "
+        "1300 rpm' -> (1300 - 0) / (2.3 - 1.0) = 1000",
+        FloatRange(), default=1000.0)
+    output_voltage_min = Property(
+        'hard safety clamp: lowest voltage ever written, regardless of target. '
+        'Defaults to exactly the characterised range (1.0-2.3 V); widen only '
+        'after confirming the scaling stays linear beyond it',
+        FloatRange(), default=1.0)
+    output_voltage_max = Property(
+        'hard safety clamp: highest voltage ever written, regardless of target',
+        FloatRange(), default=2.3)
+
+    speed_tolerance = Parameter(
+        'speed deviation from target still counted as on target',
+        FloatRange(0, unit='rpm'), default=70, readonly=False, group='tuning')
+    settle_timeout = Parameter(
+        'how long to wait for the measured speed to reach target before '
+        'reporting it as a (non-fatal) diagnostic mismatch',
+        FloatRange(0, unit='s'), default=20.0, readonly=False, group='tuning')
+
+    output_voltage = Parameter(
+        'voltage last written to the analog output (commanded, not read back '
+        '- this register has no readback mapped)',
+        FloatRange(unit='V'), readonly=True, default=0, group='drive')
+
+    _MILLIVOLTS_PER_VOLT = 1000  # unit fact, not a calibration - not a Property
+
+    def _rpm_to_voltage(self, rpm):
+        vout = self.zero_speed_voltage + rpm / self.rpm_per_volt
+        clamped = min(max(vout, self.output_voltage_min), self.output_voltage_max)
+        if clamped != vout:
+            self.log.warning(
+                '%g rpm needs %.3f V, clamped to %.3f V by output_voltage_min/max',
+                rpm, vout, clamped)
+        return clamped
+
+    def _voltage_to_raw(self, volts):
+        return int(round(volts * self._MILLIVOLTS_PER_VOLT))
+
+    def read_output_voltage(self):
+        return self.output_voltage
+
+    def write_target(self, value):
+        # Unconditional and immediate: correct regardless of whether the drive
+        # is currently enabled, and is never repeated as a side effect of
+        # anything else (in particular, never as part of recovering from
+        # quick stop - see the class docstring).
+        volts = self._rpm_to_voltage(value)
+        self._write('write_target_voltage', self._voltage_to_raw(volts))
+        self.output_voltage = volts
+        return super().write_target(value)  # fault-check + start the state machine
+
+    @status_code(BUSY, 'confirming speed')
+    def running(self, sm):
+        """The voltage is already on the output by the time this runs (see
+        write_target) - this only confirms the drive is actually turning at
+        the expected speed, for diagnostics, and reports (without chasing)
+        when it is not because the drive is not enabled."""
+        if sm.init:
+            sm.deadline = sm.now + self.settle_timeout
+        sw = self._drv('read_status_word')
+        if StatusControl.is_fault(sw):
+            raise HardwareError(
+                f'drive faulted while running '
+                f'(error 0x{self._drv("read_error_code"):04X})')
+        if not StatusControl.is_enabled(sw):
+            # Left 'operation enabled' on its own (interlock, most likely).
+            # The correct voltage is already asserted; there is nothing for
+            # Frappy to do but say so. read_status() overrides this to WARN
+            # with the live drive state on every poll for as long as this
+            # lasts, and reverts automatically once the drive re-enables -
+            # with the state machine sitting exactly here, untouched.
+            return self.final_status(IDLE, f'holding {sm.target:g} rpm setpoint')
+        speed = self._raw_to_rpm(self._drv('read_velocity_value'))
+        if abs(speed - sm.target) <= self.speed_tolerance:
+            if sm.target:
+                return self.final_status(IDLE, f'rotating at {sm.target:g} rpm')
+            return self.final_status(IDLE, 'stopped')
+        if sm.now > sm.deadline:
+            # Not fatal: the voltage is correct, so this is a downstream
+            # scaling/wiring/mechanical question, not something to retry.
+            return self.final_status(
+                WARN, f'commanded {sm.target:g} rpm ({self.output_voltage:.3f} V) '
+                f'but measured {speed:g} rpm after {self.settle_timeout:g} s - '
+                f'check rpm_per_volt/zero_speed_voltage and the wiring')
+        return Retry
+
+
+class EPOS4Position(EPOS4Motion):
+    """Point-to-point moves in Profile Position Mode (PPM, 0x6060 = 1).
+
+    ``target`` degrees are converted through the same encoder-count scaling as
+    the read-only ``position`` (see ``counts_per_turn`` / ``gear_ratio``), but
+    UNWRAPPED - i.e. a target of 370 deg is a real destination more than one
+    turn away, not equivalent to 10 deg. ``position`` itself still displays
+    wrapped to one turn (0-360), so after a move to 370 deg, ``position`` will
+    read 10 while ``target`` still reads 370. If this axis has a limited
+    range of travel rather than tumbling freely, that is probably not the
+    convention you want - say so and this can be changed to work in signed,
+    unwrapped degrees throughout instead.
+
+    Not currently exercised against hardware (unlike EPOS4Velocity) - the
+    CiA-402 sequence (rising edge of controlword bit 4 latches a new set-point,
+    bit 12 acknowledges it, bit 10 confirms arrival) is implemented per spec,
+    but treat the timeouts/tolerances as starting points.
+
+    Profile Position Mode - not Cyclic Synchronous Position - is used
+    deliberately: CSP expects a fresh target every SYNC/interpolation cycle
+    (typically millisecond-scale) or it faults on a following-error timeout,
+    which a poll-driven Modbus/SDO gateway like this one cannot sustain. PPM's
+    single-set-point-then-wait model is exactly this driver's shape.
+    """
+    OPERATING_MODE = OperatingMode.PROFILE_POSITION
+
+    target = Parameter('target shaft position (unwrapped, see class docs)',
+                       FloatRange(unit='deg'), readonly=False, default=0)
+    value = Parameter('current shaft position, wrapped to one turn',
+                      FloatRange(unit='deg'))
+
+    profile_velocity = Parameter(
+        'speed used while moving to a new target',
+        FloatRange(0, unit='rpm'), default=100, readonly=False, group='tuning')
+    position_tolerance = Parameter(
+        'position deviation from target still counted as arrived',
+        FloatRange(0, unit='deg'), default=1.0, readonly=False, group='tuning')
+    move_timeout = Parameter(
+        'timeout for a move to complete',
+        FloatRange(0, unit='s'), default=30.0, readonly=False, group='tuning')
+    ack_timeout = Parameter(
+        'timeout for the drive to acknowledge a new set-point (statusword '
+        'bit 12) - a short, separate budget from move_timeout, since an '
+        'unacknowledged set-point will never move at all',
+        FloatRange(0, unit='s'), default=2.0, readonly=False, group='tuning')
+
+    def _update_value(self):
+        self.value = self.position
+
+    @nopoll
+    def read_value(self):
+        return self.read_position()
+
+    @status_code(BUSY, 'moving')
+    def running(self, sm):
+        if sm.init:
+            self._write('write_target_position', self._deg_to_raw(sm.target))
+            self._write('write_target_velocity',
+                        self._rpm_to_raw(self.profile_velocity))
+            # PPM handshake: a RISING edge of controlword bit 4 latches the
+            # new set-point. enabling() leaves the controlword at plain
+            # ENABLE_OPERATION (bit 4 low), so raising it here is a real edge.
+            self._write_controlword(int(ControlWord.ENABLE_OPERATION))
+            self._write_controlword(int(ControlWord.ENABLE_OPERATION) | (1 << 4))
+            sm.ack_deadline = sm.now + self.ack_timeout
+            sm.move_deadline = sm.now + self.move_timeout
+            sm.acked = False
+            # the statusword in hand predates every write above
+            return Retry
+        sw = self._drv('read_status_word')
+        if StatusControl.is_fault(sw):
+            raise HardwareError(
+                f'drive faulted while moving '
+                f'(error 0x{self._drv("read_error_code"):04X})')
+        if not StatusControl.is_enabled(sw):
+            _, state = StatusControl.get_state(sw)
+            return self.final_status(
+                WARN, f'{DRIVE_STATE_TEXT[state]} - move interrupted')
+        if not sm.acked:
+            if sw & StatusWord.SETPOINT_ACK:
+                sm.acked = True
+                # drop bit 4 back to low so the NEXT move gets a fresh edge
+                self._write_controlword(int(ControlWord.ENABLE_OPERATION))
+                return Retry
+            if sm.now > sm.ack_deadline:
+                raise HardwareError(
+                    'drive did not acknowledge the new set-point (statusword '
+                    f'bit 12 never set, 0x{sw:04X}) - check '
+                    'write_target_position/write_control_word mapping')
+            return Retry
+        if sw & StatusWord.TARGET_REACHED:
+            return self.final_status(IDLE, f'at {sm.target:g} deg')
+        if sm.now > sm.move_deadline:
+            here = self._raw_to_deg(self._drv('read_position_value'))
+            raise HardwareError(
+                f'did not reach {sm.target:g} deg within {self.move_timeout:g} s '
+                f'(at {here:g} deg)')
+        return Retry

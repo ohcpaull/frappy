@@ -26,23 +26,23 @@ modules reuse ``MeComIO`` / ``TECBase`` from :mod:`frappy_acns.sample_changer`
 and are not part of this file yet.
 
 All EPOS4/CiA-402 behaviour lives in :mod:`frappy_acns.epos4`; only what is
-specific to the tumbler belongs here.
+specific to the tumbler belongs here. The rotation axis is commanded through
+an analog output voltage rather than CANopen 0x60FF, because of a safety
+interlock that must be able to stop and restart it without any intervention
+from this driver - see :class:`frappy_acns.epos4.EPOS4Velocity` for the full
+explanation of why, and why that class must never send a controlword to
+resume from quick stop on this axis.
 """
 
-from frappy.core import FloatRange, Parameter
-
-from .epos4 import EPOS4Motion
+from .epos4 import EPOS4Velocity
 
 
-class TumblerRotation(EPOS4Motion):
-    """Continuous rotation of a tumbler axis (EPOS4 profile velocity mode).
+class TumblerRotation(EPOS4Velocity):
+    """Continuous rotation of a tumbler axis, via analog-voltage CSV.
 
     Configure one module per drive, all sharing a single ``ModbusIO``, each
-    with the ``read_offset`` / ``write_offset`` of its register window in the
-    gateway.
+    with the ``input_offset`` / ``holding_offset`` of its register window in
+    the gateway, and with ``zero_speed_voltage`` / ``rpm_per_volt`` /
+    ``output_voltage_min`` / ``output_voltage_max`` set to this axis's actual
+    calibration if it differs from the EPOS4Velocity defaults.
     """
-    target = Parameter('commanded tumbling speed',
-                       FloatRange(-500, 500, unit='rpm'), readonly=False,
-                       default=0)
-    value = Parameter('actual tumbling speed',
-                      FloatRange(-500, 500, unit='rpm'))
