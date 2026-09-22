@@ -27,11 +27,16 @@ and are not part of this file yet.
 
 All EPOS4/CiA-402 behaviour lives in :mod:`frappy_acns.epos4`; only what is
 specific to the tumbler belongs here. The rotation axis is commanded through
-an analog output voltage rather than CANopen 0x60FF, because of a safety
+an analog output voltage rather than CANopen 0x60FF, because of a shroud
 interlock that must be able to stop and restart it without any intervention
 from this driver - see :class:`frappy_acns.epos4.EPOS4Velocity` for the full
 explanation of why, and why that class must never send a controlword to
-resume from quick stop on this axis.
+resume motion on this axis.
+
+The interlock and the ``stop`` command act through different mechanisms, which
+is worth knowing when reading the status: the interlock gates the drive's
+'Drive enable' digital input, while ``stop`` leaves the drive enabled and
+commands zero speed on the analog output.
 """
 
 from .epos4 import EPOS4Velocity

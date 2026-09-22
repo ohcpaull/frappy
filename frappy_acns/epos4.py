@@ -68,11 +68,17 @@ class StatusWord(IntFlag):
     SWITCH_ON_DISABLED = 0x0040
     WARNING = 0x0080
     REMOTE = 0x0200
+    # bit 10: meaning is mode-dependent - 'target reached' in the profiled
+    # modes (PPM/PVM/HMM), but RESERVED in CSP/CSV (firmware spec table 3-42).
+    # Never test it in a cyclic synchronous mode: it may read 0 forever, or
+    # read 1 while the axis is still turning.
     TARGET_REACHED = 0x0400
     INTERNAL_LIMIT = 0x0800
     # bit 12: meaning is mode-dependent - 'set-point acknowledged' in Profile
     # Position Mode (what we use it for), 'homing attained' in Homing mode,
-    # 'drive follows the command value' in CSP/CSV.
+    # 'drive follows the command value' in CSP/CSV. In CSV that is a useful
+    # diagnostic but NOT a standstill test: it says the drive is tracking
+    # *a* set value, not that the set value is zero.
     SETPOINT_ACK = 0x1000
 
 
@@ -82,13 +88,20 @@ class ControlWord(IntEnum):
     Operating-mode motion bits (PPM bit 4 'new set-point', bit 6 abs/rel,
     bit 8 'halt') are OR-ed onto ENABLE_OPERATION *after* the drive is
     enabled - they are not part of the state-machine sequence.
+
+    The cyclic synchronous modes ignore ALL of those mode-specific bits
+    ("Cyclic Synchronous Velocity Mode does not use mode-specific controlword
+    bits", firmware spec 3.7.1), so in CSP/CSV only the state-machine commands
+    below have any effect.
     """
     DISABLE_VOLTAGE = 0x0000        # -> switch on disabled  (coast)
     QUICK_STOP = 0x0002             # -> quick stop active
     SHUTDOWN = 0x0006               # -> ready to switch on
     SWITCH_ON = 0x0007              # -> switched on  (== 'disable operation')
     ENABLE_OPERATION = 0x000F       # -> operation enabled
-    ENABLE_OPERATION_HALT = 0x010F  # enabled, holding (halt bit 8)
+    # enabled, holding (halt bit 8). Profiled modes only - CSP/CSV ignore it,
+    # so writing this does NOT stop a cyclic axis. See _command_standstill.
+    ENABLE_OPERATION_HALT = 0x010F
     FAULT_RESET = 0x0080            # rising edge of bit 7 clears a fault
 
 
@@ -472,7 +485,9 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
     """Shared CiA-402 enable/disable/fault handling for a driven EPOS4 axis.
 
     Not used directly - subclass and set ``OPERATING_MODE`` plus a ``running``
-    state function. See :class:`EPOS4Velocity` and :class:`EPOS4Position`.
+    state function, and - if the mode does not respond to the CiA-402 halt bit
+    - a ``_command_standstill``. See :class:`EPOS4Velocity` and
+    :class:`EPOS4Position`.
 
     ``write_target`` runs a non-blocking state machine: :meth:`enabling` walks
     the drive to 'operation enabled' in ``OPERATING_MODE``, one CiA-402
@@ -488,15 +503,30 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
 
     #: Whether the enable sequence is allowed to send ENABLE_OPERATION to move
     #: the drive out of Quick Stop Active on its own. Default False: quick
-    #: stop is treated as an externally-imposed condition (e.g. a safety
-    #: interlock) that this driver must never talk the drive out of - only
-    #: hardware/an operator gets to end it. Set True in the module's config
-    #: only for an axis you have confirmed has no such interlock and where
-    #: automatic recovery from quick stop is actually wanted.
+    #: stop is treated as an externally-imposed condition that this driver must
+    #: never talk the drive out of - only hardware/an operator gets to end it.
+    #: Set True in the module's config only for an axis where automatic
+    #: recovery from quick stop is actually wanted.
+    #:
+    #: NB this guards ONLY Quick Stop Active. An interlock wired to a digital
+    #: input configured as 'Drive enable' (function 27) rather than 'Quick
+    #: stop' (28) leaves the drive in Switch On Disabled instead, which the
+    #: ladder in StatusControl._ENABLE_STEP will happily walk back up.
     resume_from_quickstop = Property(
         'allow the enable sequence to leave Quick Stop Active by sending '
-        'Enable Operation. Leave False for any axis with a safety interlock '
-        'wired through quick stop - see the class docstring.',
+        'Enable Operation. Leave False for any axis whose interlock is wired '
+        'to a digital input configured as Quick stop - see the class docstring.',
+        datatype=datatypes.BoolType(), default=False)
+
+    #: Whether stop() switches the power stage off once the axis is at rest.
+    #: Default False: the drive stays enabled and actively holds zero speed.
+    #: True leaves the shaft free to turn by hand - useful for sample access.
+    #: Either way the next target write re-enables the drive on its own.
+    disable_after_stop = Property(
+        'after stop() has brought the axis to a standstill, send Disable '
+        'Operation (controlword 0x0007) to switch off the power stage, leaving '
+        'the shaft free to turn by hand. Default False: the drive stays '
+        'enabled and actively holds zero speed.',
         datatype=datatypes.BoolType(), default=False)
 
     enable_timeout = Parameter('timeout for the CiA-402 enable sequence '
@@ -504,7 +534,12 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
                                'see resume_from_quickstop)',
                                FloatRange(0, unit='s'), default=3.0,
                                readonly=False, group='tuning')
-    stop_timeout = Parameter('timeout for coming to a standstill after stop()',
+    stop_timeout = Parameter('timeout for coming to a standstill after stop(). '
+                             'This is only a diagnostic budget - what actually '
+                             'sets the deceleration is the drive: the slowdown '
+                             'ramp (0x6084) for a halt, or Max acceleration '
+                             '(0x60C5) where the set-point comes from an analog '
+                             'input, as in CSV',
                              FloatRange(0, unit='s'), default=10.0,
                              readonly=False, group='tuning')
     stop_speed_tolerance = Parameter(
@@ -512,12 +547,16 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
         FloatRange(0, unit='rpm'), default=2.0, readonly=False, group='tuning')
 
     _blocking_fault = None
+    _idle_disabled = False  # power stage switched off deliberately by stop()
 
     # -- driving -----------------------------------------------------------
     def write_target(self, value):
         if self._blocking_fault:
             raise HardwareError(
                 f'{self._blocking_fault} - run reset_fault first')
+        # a new move supersedes any deliberate power-down done by stop(), so
+        # 'not enabled' goes back to meaning something is wrong (read_status)
+        self._idle_disabled = False
         self.start_machine(self.enabling, target=value)
         return value
 
@@ -601,29 +640,76 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
                 'leave this state. Check STO/enable wiring, motor supply '
                 'voltage, and the error code above.')
 
+    # -- stopping ----------------------------------------------------------
+    def _command_standstill(self):
+        """Tell the drive to come to a standstill, however this profile does it.
+
+        Must not send a controlword that could resume motion, and must not
+        disable the power stage - :meth:`stopping` does that separately, and
+        only once the axis is already at rest.
+
+        Base implementation: the CiA-402 halt bit, which is what Profile
+        Position Mode uses. That is only safe because
+        :meth:`EPOS4Position.running` writes a plain ENABLE_OPERATION at
+        ``sm.init``, clearing bit 8 again on the next move - a subclass whose
+        ``running`` does not do that MUST override this, or the axis will stay
+        halted forever. :class:`EPOS4Velocity` overrides it for a different
+        reason: the cyclic synchronous modes ignore every mode-specific
+        controlword bit, the halt bit included (firmware spec 3.7.1).
+        """
+        self._write_controlword(ControlWord.ENABLE_OPERATION_HALT)
+
     @status_code(BUSY, 'stopping')
     def stopping(self, sm):
+        """Wait out the standstill that :meth:`stop` has already commanded.
+
+        The test is the MEASURED speed, and only that. Statusword bit 10
+        ('target reached') is deliberately not consulted: its meaning is
+        mode-specific and it is reserved in the cyclic synchronous modes
+        (firmware spec table 3-42), so it cannot mean the same thing for every
+        subclass of this class. Actual shaft speed can.
+        """
+        if self._fields is None:
+            return Retry  # no block read yet
         if sm.init:
-            self._write_controlword(ControlWord.ENABLE_OPERATION_HALT)
             sm.deadline = sm.now + self.stop_timeout
-            # the statusword we hold predates the halt write - wait for a
-            # fresh one rather than believe it
-            return Retry
         sw = self._drv('read_status_word')
         speed = self._raw_to_rpm(self._drv('read_velocity_value'))
-        if (sw & StatusWord.TARGET_REACHED
-                or abs(speed) <= self.stop_speed_tolerance):
+        if abs(speed) <= self.stop_speed_tolerance:
+            # Only disable a drive that is actually ours to disable. If it has
+            # already left 'operation enabled', something else stopped it (an
+            # interlock, most likely) and claiming credit here would mask that
+            # as a tidy 'power stage off' in read_status.
+            if self.disable_after_stop and StatusControl.is_enabled(sw):
+                self._write_controlword(ControlWord.SWITCH_ON)
+                self._idle_disabled = True
             return self.final_status(IDLE, 'stopped')
         if sm.now > sm.deadline:
             return self.final_status(
-                WARN, f'still turning at {speed:g} rpm after halt')
+                WARN, f'still turning at {speed:g} rpm {self.stop_timeout:g} s '
+                f'after stop was commanded (statusword 0x{sw:04X})')
         return Retry
 
     @Command
     def stop(self):
-        """Halt (decelerate to standstill), leaving the power stage enabled."""
+        """Bring the axis to a standstill, leaving the power stage enabled
+        unless ``disable_after_stop`` is set.
+
+        How a standstill is commanded is mode-specific (see
+        :meth:`_command_standstill`); that it has been reached is judged from
+        the measured speed alone.
+        """
+        # Immediately, in the caller's thread. Deferring this to the state
+        # machine would mean up to a pollinterval of continued rotation after
+        # the operator asked for a stop. Same reasoning as
+        # EPOS4Velocity.write_target, which also writes its setpoint straight
+        # away rather than from a state function.
+        self._command_standstill()
+        # Only announced once that write actually reached the drive: if it
+        # raises, target keeps reading the speed that is in fact still
+        # commanded, rather than a reassuring zero.
         self.target = 0
-        self.start_machine(self.stopping, target=0)
+        self.start_machine(self.stopping)
 
     @Command(IntRange(0, 0xFFFF), result=IntRange(0, 0xFFFF),
              visibility='expert')
@@ -688,6 +774,12 @@ class EPOS4Motion(HasStates, Drivable, EPOS4Base):
             return WARN, DRIVE_STATE_TEXT[state]
         machine = super().read_status()  # HasStates -> state machine status
         if machine[0] == IDLE and state != DriveState.OPERATION_ENABLED:
+            if self._idle_disabled and state == DriveState.SWITCHED_ON:
+                # stop() switched the power stage off on purpose
+                # (disable_after_stop) - that is not something to warn about.
+                # Matching SWITCHED_ON only is deliberate: a drive disabled by
+                # an interlock lands elsewhere and still reports WARN below.
+                return IDLE, 'stopped, power stage off'
             # idle, but the drive is not actually under power
             return WARN, DRIVE_STATE_TEXT[state]
         return machine
@@ -711,13 +803,10 @@ class EPOS4Velocity(EPOS4Motion):
     and ``target`` is not written to 0x60FF at all - it is converted to a
     voltage and written to one of the drive's analog outputs (object 0x3240,
     "Analog output general purpose A" in this register map). That output is
-    wired externally to an analog input that the actual speed reference is
-    scaled from (my understanding, not yet confirmed against your wiring
-    diagram: this is the SAME EPOS4's own analog input, routed back in through
-    the interlock relay, and CSV is configured in EPOS Studio to take its
-    cyclic set-point from that analog value rather than from 0x60FF - please
-    correct me if that is wrong, since it does not change what this class
-    does, only how I have described why it works).
+    wired back into the same EPOS4's own analog input, which is configured as
+    "Set value velocity" (0x3161 = 9) so that CSV takes its cyclic set-point
+    from the analog value rather than from 0x60FF, with the scaling set by
+    0x3171 ("Analog input velocity set value properties").
 
     Because the analog output register is a plain, always-on value with no
     "apply this" handshake, writing ``target`` is a one-shot register write,
@@ -727,9 +816,40 @@ class EPOS4Velocity(EPOS4Motion):
     into CSV mode and confirm it is enabled; it never needs to, and never
     does, re-touch the voltage once written.
 
-    ``resume_from_quickstop`` defaults to False (inherited from
-    :class:`EPOS4Motion`) for exactly the reason above. Do not override it to
-    True on an axis with this interlock.
+    **Stopping.** The halt bit this class inherits from :class:`EPOS4Motion` is
+    inoperative here - "Cyclic Synchronous Velocity Mode does not use
+    mode-specific controlword bits" (firmware spec 3.7.1) - so
+    :meth:`_command_standstill` is overridden to lower the analog output to
+    ``zero_speed_voltage`` instead. That is the only honest stop on this axis:
+    the analog voltage is what the drive resumes from, so a stop that leaves it
+    high would spin the axis straight back up the moment anything returned the
+    drive to 'operation enabled'. It also means a stop writes no controlword at
+    all, which is the same principle the class is built around. The
+    deceleration is set by the drive's Max acceleration (0x60C5), which limits
+    how fast the analog set value may slew - not by ``stop_timeout``, and not
+    by the profile deceleration used by a halt.
+
+    Quick stop would also work in CSV (it is a state-machine transition rather
+    than a mode-specific bit), but it is not used: it cannot replace zeroing
+    the voltage for the reason above, and Quick stop option code 0x605A is
+    fixed at 6 on the EPOS4 - "decelerate with quick stop ramp and *stay in*
+    Quick stop active" - so it would latch the axis in a state this driver
+    refuses to leave. Raise 0x60C5 in EPOS Studio if the ramp-down is too slow.
+
+    **The interlock.** On the tumbler it gates the drive's 'Drive enable'
+    digital input (0x3142 function 27), not Quick stop (28), so engaging it
+    drops the drive out of 'operation enabled' rather than into Quick Stop
+    Active. Two consequences worth knowing:
+
+    - ``resume_from_quickstop`` (inherited, default False) does NOT guard this
+      axis, because the ladder in ``StatusControl._ENABLE_STEP`` will walk a
+      drive back up out of Switch On Disabled. Leave it False regardless - it
+      costs nothing and is correct for any axis that is wired the other way.
+    - :meth:`running` already handles the drive leaving 'operation enabled'
+      without chasing it: the correct voltage stays asserted, the state machine
+      sits still, and :meth:`read_status` reports WARN until the drive comes
+      back. No controlword is sent at any point, which is what lets the
+      interlock stop and release the axis entirely on its own.
     """
     OPERATING_MODE = OperatingMode.CYCLIC_SYNC_VELOCITY
 
@@ -791,15 +911,48 @@ class EPOS4Velocity(EPOS4Motion):
     def read_output_voltage(self):
         return self.output_voltage
 
+    def _write_speed_reference(self, rpm):
+        """Command ``rpm`` on the analog output and publish what was written.
+
+        In CSV the set-point comes from the analog input, so writing the analog
+        output IS commanding a speed. This is the single place that happens -
+        both :meth:`write_target` and the stop path go through here, so
+        ``target``, ``output_voltage`` and the register can never disagree
+        about what this axis was last told.
+
+        Note this deliberately goes through :meth:`_rpm_to_voltage` even for
+        zero, rather than using ``zero_speed_voltage`` directly, so that a cfg
+        whose voltage clamp no longer agrees with its calibration gets the
+        usual warning on the stop path too instead of silently commanding a
+        non-zero speed.
+        """
+        volts = self._rpm_to_voltage(rpm)
+        self._write('write_target_voltage', self._voltage_to_raw(volts))
+        # Belt and braces. The firmware spec is not explicit about whether the
+        # analog 'Set value velocity' function replaces 0x60FF or is summed
+        # with it (it does force Velocity offset 0x60B1 to zero - spec
+        # 6.2.80.1). A stale non-zero 0x60FF - left by this driver's Profile
+        # Velocity ancestor, or by a bench session in EPOS Studio - would be a
+        # speed contribution the analog output cannot cancel, so stop() would
+        # not stop. Asserting zero can only ever remove that term: the axis is
+        # known to follow the analog voltage as it is.
+        self._write('write_target_velocity', 0)
+        self.output_voltage = volts
+        return volts
+
     def write_target(self, value):
         # Unconditional and immediate: correct regardless of whether the drive
         # is currently enabled, and is never repeated as a side effect of
         # anything else (in particular, never as part of recovering from
         # quick stop - see the class docstring).
-        volts = self._rpm_to_voltage(value)
-        self._write('write_target_voltage', self._voltage_to_raw(volts))
-        self.output_voltage = volts
+        self._write_speed_reference(value)
         return super().write_target(value)  # fault-check + start the state machine
+
+    def _command_standstill(self):
+        """CSV ignores the halt bit (firmware spec 3.7.1), so a stop here is
+        simply a zero-speed command on the same analog output that every other
+        speed goes through - no controlword involved."""
+        self._write_speed_reference(0)
 
     @status_code(BUSY, 'confirming speed')
     def running(self, sm):
