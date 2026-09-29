@@ -23,7 +23,7 @@ demo example for tutorial
 """
 
 from frappy.core import Readable, Parameter, FloatRange, HasIO, StringIO, Property, StringType, \
-    IDLE, BUSY, WARN, ERROR, Drivable, IntRange
+    IDLE, BUSY, WARN, ERROR, Drivable, IntRange, EnumType, Command, Writable
 
 
 class LakeshoreIO(StringIO):
@@ -44,14 +44,31 @@ class TemperatureSetpoint(HasIO, Readable):
         reply = self.communicate(f'SETP?{self.output}')
         return float(reply)
 
-
-class Heater(HasIO, Readable):
-
+class HeaterBase(HasIO, Readable):
     ioClass = LakeshoreIO
-    output = Property('the Lakeshore heater output channel', datatype=IntRange(1,2), default=1)
-    # 'value' is the Readable parameter, not a Property (it is read from the hardware)
+
     value = Parameter('the Lakeshore heater power in percent',
-                      datatype=FloatRange(min=0, max=100, unit='%'))
+                          datatype=FloatRange(min=0, max=100, unit='%'))
+    range = Parameter('output range. Changes depending on outputs (1,2) and (3,4).', 
+                      datatype=IntRange(0,3))
+
+    def read_range(self):
+        reply = int(self.communicate(f'RANGE? {self.output}'))
+        return reply
+
+    def write_range(self, range):
+        reply = self.communicate(f'RANGE {self.output},{range}')
+        return self.read_range()
+        
+
+class Heater(HeaterBase, Readable):
+
+    # if output is 1 or 2, it comes from the lakeshore heater output. If it is 3 or 4, it is an analog output
+    # from the lakeshore that goes to a TDK Lambda power supply which drives the heater. 
+    output = Property('the Lakeshore heater output channel', datatype=IntRange(1,2), default=1)
+    range = Parameter(
+                'Output range of heater. 0-3 for Lakeshore output ', 
+                datatype=EnumType(OFF=0, LOW=1, MEDIUM=2, HIGH=3))
 
     def read_value(self):
         reply = self.communicate(f'HTR? {self.output}')
@@ -67,6 +84,23 @@ class Heater(HasIO, Readable):
         else:
             return IDLE, "No error"
 
+
+class AnalogHeater(HeaterBase):
+    '''
+    LS336 Analog output heater, driving an external TDK Lambda power supply. Output
+    is unipolar from 0 - 10 V. Lakeshore output is either 3 or 4. 
+    '''
+    output = Property('the Lakeshore heater output channel', datatype=IntRange(3,4), default=3)
+
+    range = Parameter(
+                'Output range of heater. 0-3 for Lakeshore output and 0-1 for analogue output',
+                datatype=EnumType(OFF=0, ON=1))
+
+    def read_value(self):
+        reply = self.communicate(f'AOUT? {self.output}')
+        return float(reply)
+
+    
 
 class TemperatureSensor(HasIO, Readable):
     """a temperature sensor (generic for different models)"""
