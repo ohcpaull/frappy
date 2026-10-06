@@ -46,18 +46,21 @@ class TemperatureSetpoint(HasIO, Readable):
 
 class HeaterBase(HasIO, Readable):
     ioClass = LakeshoreIO
-
+    output = Property('the Lakeshore heater output channel', datatype=IntRange(1,4), default=1)
     value = Parameter('the Lakeshore heater power in percent',
                           datatype=FloatRange(min=0, max=100, unit='%'))
     range = Parameter('output range. Changes depending on outputs (1,2) and (3,4).', 
-                      datatype=IntRange(0,3))
+                      datatype=IntRange(0,3), readonly=False)
+
+    def read_value(self):
+        pass
 
     def read_range(self):
         reply = int(self.communicate(f'RANGE? {self.output}'))
         return reply
 
     def write_range(self, range):
-        reply = self.communicate(f'RANGE {self.output},{range}')
+        self.communicate(f'RANGE {self.output},{range.value};*OPC?')
         return self.read_range()
         
 
@@ -139,7 +142,7 @@ class TemperatureLoop(TemperatureSensor, TemperatureSetpoint, Drivable):
     # lakeshore loop number to be used for this module
     loop = Property('lakeshore loop', IntRange(1, 2), default=1)
     target = Parameter(datatype=FloatRange(unit='K', min=0, max=1500))
-    heater_range = Property('heater power range', IntRange(0, 5))  # max. 3 on LakeShore 336
+    heater_range = Property('heater power range', IntRange(0, 3))  # max. 3 on LakeShore 336
     tolerance = Parameter('convergence criterion', FloatRange(0), default=0.1, readonly=False)
     _driving = False
 
@@ -152,7 +155,7 @@ class TemperatureLoop(TemperatureSensor, TemperatureSetpoint, Drivable):
         # Setting the status attribute triggers an update message for the SECoP status
         # parameter. This has to be done before returning from this method!
         self.status = BUSY, 'target changed'
-        return target
+        return self.read_setpoint()
 
     def read_status(self):
         code = int(self.communicate(f'RDGST?{self.channel}'))
