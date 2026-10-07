@@ -44,7 +44,7 @@ MISO response frames are similar in construction but include a status byte
 
 Reference: Sensirion SFC5xxx SHDLC Interface Reference V1.9
 '''
-from frappy.core import BytesIO, HasIO, Drivable, Parameter, FloatRange, IDLE, WARN, ERROR
+from frappy.core import BytesIO, HasIO, Drivable, Parameter, StringType, IntRange, FloatRange, IDLE, WARN, ERROR,Command
 from frappy import datatypes
 from frappy.errors import CommunicationFailedError, HardwareError
 from dataclasses import dataclass, replace
@@ -88,6 +88,18 @@ COMMANDS = {
         command_ID=0xD2,
         data_length=1,
         scaling=0x00,  # for 0xD2 this byte is 'clear after read': 0x00 = do not clear
+        data=None
+    ),
+    "read_calibration_info": MOSICommand(
+        command_ID=0x40,
+        data_length=5,
+        scaling=0x00,
+        data=None
+    ),
+    "read_current_calibration": MOSICommand(
+        command_ID=0x44,
+        data_length=1,
+        scaling=0x11,
         data=None
     )
 }
@@ -140,6 +152,26 @@ DEVICE_STATE_FLAGS = {
     10: 'missing gas pressure',
 }
 
+UNIT_TABLE = {
+    0: "norm litre",
+    1: "standard litre",
+    8: "litre (liquid)",
+    9: "gram",
+    16: "pascal",
+    17: "bar",
+    18: "metre H2O",
+    19: "inch H2O",
+}
+
+TIMEBASE_TABLE = {
+    0: None,
+    1: 'us',
+    2: 'ms',
+    3: 's',
+    4: 'min',
+    5: 'h',
+    6: 'day'
+}
 
 class SensirionIO(BytesIO):
     _eol_read = bytes([START_STOP])  # readline() reads up to the next 0x7E
@@ -278,8 +310,12 @@ class SensirionIO(BytesIO):
 class SFC5xxx(HasIO, Drivable):
     ioClass = SensirionIO
 
-    target = Parameter('Target flow rate', FloatRange(unit='sccm'))
-    value = Parameter('Measured flow rate', FloatRange(unit='sccm'))
+    target = Parameter('Target flow rate', FloatRange(unit='slm'))
+    value = Parameter('Measured flow rate', FloatRange(unit='slm'))
+    gas = Parameter('Current calibrated gas loaded',StringType(), readonly=True)
+    gas_ID = Parameter('Current calibrated gas ID',IntRange(0,1000), readonly=True)
+    units = Parameter('Units for current configuration', StringType(), readonly=True)
+    calib_mem = Parameter('Size of calibration memory', IntRange(0,200), readonly=True)
 
     def read_value(self):
         reply = self.io.query(COMMANDS['read_flow'])
@@ -303,11 +339,37 @@ class SFC5xxx(HasIO, Drivable):
         reply = self.io.query(COMMANDS['read_setpoint'])
         return struct.unpack('>f', reply)[0]
 
+    def read_gas(self):
+        gas_descr = self.io.query(COMMANDS['read_current_calibration'])
+        return str(gas_descr.rstrip(b'\x00').decode('utf-8'))
+
+    def read_gas_ID(self):
+        cmd = replace(COMMANDS['read_current_calibration'])
+        cmd.scaling = 0x12
+        gas_ID = int.from_bytes(self.io.query(cmd), byteorder='big')
+        return gas_ID
+
+    def read_units(self):
+        cmd = replace(COMMANDS['read_current_calibration'])
+        cmd.scaling=0x13
+        gas_unit = self.io.query(cmd)
+        prefix = int(gas_unit[0])
+        unit = UNIT_TABLE[int(gas_unit[1])]
+        timebase = TIMEBASE_TABLE[int(gas_unit[2])]
+
+        return f"x10^{prefix} {unit} per {timebase}"
+
+    def read_calib_mem(self):
+        cmd = MOSICommand(
+            command_ID=0x40,
+            data_length=1,
+            scaling=0x00
+        )
+        reply = int.from_bytes(self.io.query(cmd), byteorder='big')
+        return reply
+
     def write_target(self, target):
         # replace() makes a copy, so the shared COMMANDS entry is not modified
         cmd = replace(COMMANDS['write_setpoint'], data=struct.pack('>f', target))
         self.io.query(cmd)  # reply has no data
         return self.read_target()
-
-    
-    
