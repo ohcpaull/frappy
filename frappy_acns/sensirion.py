@@ -44,9 +44,10 @@ MISO response frames are similar in construction but include a status byte
 
 Reference: Sensirion SFC5xxx SHDLC Interface Reference V1.9
 '''
-from frappy.core import BytesIO, HasIO, Drivable, Parameter, StringType, IntRange, FloatRange, IDLE, WARN, ERROR,Command
+from frappy.core import BytesIO, HasIO, Drivable, Parameter, StringType, IntRange, FloatRange, IDLE, WARN, ERROR,Command, \
+    ArrayOf, StructOf
 from frappy import datatypes
-from frappy.errors import CommunicationFailedError, HardwareError
+from frappy.errors import CommunicationFailedError, HardwareError, RangeError
 from dataclasses import dataclass, replace
 import struct
 from enum import IntEnum
@@ -62,8 +63,9 @@ ADDRESS = 0X00
 class MOSICommand:
     command_ID: int
     data_length: int
-    scaling: int
+    scaling: int | None  # first Tx data byte (scaling or sub command), None: not sent
     data: bytes | None = None  # Tx data after the scaling byte, e.g. a packed float
+    timeout: float | None = None  # for slow commands: overrides the IO timeout
 
 COMMANDS = {
     "write_setpoint": MOSICommand(
@@ -101,6 +103,13 @@ COMMANDS = {
         data_length=1,
         scaling=0x11,
         data=None
+    ),
+    "load_calibration": MOSICommand(
+        command_ID=0x45,
+        data_length=4,
+        scaling=None,  # Tx data is only the u32 location
+        data=None,
+        timeout=3.2  # manual 5.7.1: response time up to 1.6 s, use 2x
     )
 }
 
@@ -173,6 +182,14 @@ TIMEBASE_TABLE = {
     6: 'day'
 }
 
+
+def decode_unit(reply: bytes) -> str:
+    '''Gas unit reply of 0x40/0x44 sub command 0x13 (manual 6.5):
+    prefix (i8t, signed: -3 = milli), unit (u8t), timebase (u8t)'''
+    prefix, unit, timebase = struct.unpack('>bBB', reply)
+    return f"x10^{prefix} {UNIT_TABLE.get(unit, 'undefined')} per {TIMEBASE_TABLE.get(timebase)}"
+
+
 class SensirionIO(BytesIO):
     _eol_read = bytes([START_STOP])  # readline() reads up to the next 0x7E
     # manual 4.4.2: at least 200 ms. Extra margin for the TCP serial server
@@ -184,16 +201,28 @@ class SensirionIO(BytesIO):
         Raises HardwareError if the device reports an execution error.
         '''
         # MOSI frame content: Adr, CMD, L, Tx Data (scaling byte + optional data)
-        content = bytearray([ADDRESS, command.command_ID, command.data_length, command.scaling])
+        content = bytearray([ADDRESS, command.command_ID, command.data_length])
+        if command.scaling is not None:
+            content.append(command.scaling)
         if command.data:
             content.extend(command.data)
         content.append(self.calc_crc(content))
         frame = bytes([START_STOP]) + self.escape(content) + bytes([START_STOP])
         self.log.debug('TX %s', frame.hex(' '))
 
-        # replylen=1: communicate() reads the start byte, then calls
-        # getFullReply() (below) which reads the rest up to the stop byte
-        raw_response = self.communicate(frame, 1)
+        # Slow commands (e.g. Load Calibration, up to 1.6 s) bring their own
+        # timeout. Holding the lock means no other request runs with it.
+        # (_lock is an RLock, so communicate() can take it again inside.)
+        with self._lock:
+            normal_timeout = self.timeout
+            if command.timeout:
+                self.timeout = command.timeout
+            try:
+                # replylen=1: communicate() reads the start byte, then calls
+                # getFullReply() (below) which reads the rest up to the stop byte
+                raw_response = self.communicate(frame, 1)
+            finally:
+                self.timeout = normal_timeout
         self.log.debug('RX %s', raw_response.hex(' '))
 
         # strip start and stop first, then unescape (the CRC may be stuffed too)
@@ -313,9 +342,26 @@ class SFC5xxx(HasIO, Drivable):
     target = Parameter('Target flow rate', FloatRange(unit='slm'))
     value = Parameter('Measured flow rate', FloatRange(unit='slm'))
     gas = Parameter('Current calibrated gas loaded',StringType(), readonly=True)
-    gas_ID = Parameter('Current calibrated gas ID',IntRange(0,1000), readonly=True)
+    gas_ID = Parameter('Current calibrated gas ID',IntRange(0, 0xFFFFFFFF), readonly=True)  # u32
     units = Parameter('Units for current configuration', StringType(), readonly=True)
     calib_mem = Parameter('Size of calibration memory', IntRange(0,200), readonly=True)
+    conductivity = Parameter('Thermal conductivity reference value of the loaded gas (raw sensor value)',
+                             IntRange(0, 0xFFFF), readonly=True)
+    # No read_calibrations method: this is not polled. It is filled at
+    # startup (initialReads) and by the refresh_calibrations command.
+    calibrations = Parameter('Valid calibrations in the device memory, load with load_calibration(location)',
+                             ArrayOf(StructOf(location=IntRange(0, 255),
+                                              gas=StringType(),
+                                              gas_ID=IntRange(0, 0xFFFFFFFF),
+                                              fullscale=FloatRange(),
+                                              unit=StringType()), 0, 255),
+                             readonly=True)
+
+    def initialReads(self):
+        # Called once from the poll thread at startup. callPollFunc logs an
+        # error instead of raising it, so a failure here can't stop the poll
+        # thread. Call refresh_calibrations later if the device was offline.
+        self.callPollFunc(self.refresh_calibrations)
 
     def read_value(self):
         reply = self.io.query(COMMANDS['read_flow'])
@@ -352,12 +398,12 @@ class SFC5xxx(HasIO, Drivable):
     def read_units(self):
         cmd = replace(COMMANDS['read_current_calibration'])
         cmd.scaling=0x13
-        gas_unit = self.io.query(cmd)
-        prefix = int(gas_unit[0])
-        unit = UNIT_TABLE[int(gas_unit[1])]
-        timebase = TIMEBASE_TABLE[int(gas_unit[2])]
+        return decode_unit(self.io.query(cmd))
 
-        return f"x10^{prefix} {unit} per {timebase}"
+    def read_conductivity(self):
+        # 0x44 sub command 0x17 (firmware >= 1.41): u16 reference value
+        cmd = replace(COMMANDS['read_current_calibration'], scaling=0x17)
+        return struct.unpack('>H', self.io.query(cmd))[0]
 
     def read_calib_mem(self):
         cmd = MOSICommand(
@@ -373,3 +419,49 @@ class SFC5xxx(HasIO, Drivable):
         cmd = replace(COMMANDS['write_setpoint'], data=struct.pack('>f', target))
         self.io.query(cmd)  # reply has no data
         return self.read_target()
+
+    def _calibration_info(self, info_type, location):
+        '''Get Calibration Information (0x40) about one memory location.
+        info_type: 0x10 valid, 0x11 gas, 0x12 gas ID, 0x13 unit, 0x14 fullscale'''
+        cmd = replace(COMMANDS['read_calibration_info'], scaling=info_type,
+                      data=struct.pack('>I', location))
+        return self.io.query(cmd)
+
+    @Command()
+    def refresh_calibrations(self):
+        '''Re-read the list of valid calibrations from the device memory.'''
+        calibrations = []
+        # not every location holds a valid calibration, and the invalid ones
+        # are not necessarily at the end (manual 5.7)
+        for location in range(self.read_calib_mem()):
+            if not self._calibration_info(0x10, location)[0]:
+                continue
+            calibrations.append({
+                'location': location,
+                'gas': self._calibration_info(0x11, location).rstrip(b'\x00').decode('utf-8'),
+                'gas_ID': int.from_bytes(self._calibration_info(0x12, location), byteorder='big'),
+                'fullscale': struct.unpack('>f', self._calibration_info(0x14, location))[0],
+                'unit': decode_unit(self._calibration_info(0x13, location)),
+            })
+        self.calibrations = calibrations
+        self.log.info('found %d valid calibrations', len(calibrations))
+
+    @Command(IntRange(0, 255))
+    def load_calibration(self, location):
+        '''Load the calibration at <location> (see calibrations) and run the controller.
+
+        Writes the EEPROM (limited write cycles, manual 5.7.1), so use it to
+        change gas, never periodically. Reloading the current one is harmless.
+        '''
+        valid = [c['location'] for c in self.calibrations]
+        if location not in valid:
+            raise RangeError(f'no valid calibration at location {location} (valid: {valid}).'
+                             ' Run refresh_calibrations if the list is empty')
+        cmd = replace(COMMANDS['load_calibration'], data=struct.pack('>I', location))
+        self.io.query(cmd)  # reply has no data
+        # update the parameters that describe the loaded calibration
+        self.read_gas()
+        self.read_gas_ID()
+        self.read_units()
+        self.read_conductivity()
+        self.read_target()
