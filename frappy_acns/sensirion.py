@@ -44,13 +44,14 @@ MISO response frames are similar in construction but include a status byte
 
 Reference: Sensirion SFC5xxx SHDLC Interface Reference V1.9
 '''
-from frappy.core import BytesIO, HasIO, Drivable, Parameter, StringType, IntRange, FloatRange, IDLE, WARN, ERROR,Command, \
+from frappy.core import BytesIO, HasIO, Drivable, Readable, Parameter, StringType, IntRange, FloatRange, IDLE, WARN, ERROR,Command, \
     ArrayOf, StructOf
 from frappy import datatypes
 from frappy.errors import CommunicationFailedError, HardwareError, RangeError
 from dataclasses import dataclass, replace
 import struct
 from enum import IntEnum
+import time
 
 START_STOP = 0x7E
 ESCAPED = 0x7D
@@ -288,7 +289,7 @@ class SensirionIO(BytesIO):
         '''
         Unescape response frames. Happens by identifying the ESCAPE byte 0x7D,
         and then doing XOR 0x20 on the byte after it, and keeping that byte.
-
+        
         | Original byte | Transferred data bytes | 
         | ------------- | ---------------------- |
         |       0x7E    |       0x7D, 0x5E       |
@@ -336,10 +337,10 @@ class SensirionIO(BytesIO):
         return response[-1] == SensirionIO.calc_crc(response[:-1])
 
 
-class SFC5xxx(HasIO, Drivable):
+
+class MassFlowSensor(HasIO, Readable):
     ioClass = SensirionIO
 
-    target = Parameter('Target flow rate', FloatRange(unit='slm'))
     value = Parameter('Measured flow rate', FloatRange(unit='slm'))
     gas = Parameter('Current calibrated gas loaded',StringType(), readonly=True)
     gas_ID = Parameter('Current calibrated gas ID',IntRange(0, 0xFFFFFFFF), readonly=True)  # u32
@@ -381,10 +382,6 @@ class SFC5xxx(HasIO, Drivable):
             active.append(f'boot error code {boot_error}')
         return ERROR, ', '.join(active) or f'device state 0x{state_register:08X}'
 
-    def read_target(self):
-        reply = self.io.query(COMMANDS['read_setpoint'])
-        return struct.unpack('>f', reply)[0]
-
     def read_gas(self):
         gas_descr = self.io.query(COMMANDS['read_current_calibration'])
         return str(gas_descr.rstrip(b'\x00').decode('utf-8'))
@@ -414,12 +411,6 @@ class SFC5xxx(HasIO, Drivable):
         reply = int.from_bytes(self.io.query(cmd), byteorder='big')
         return reply
 
-    def write_target(self, target):
-        # replace() makes a copy, so the shared COMMANDS entry is not modified
-        cmd = replace(COMMANDS['write_setpoint'], data=struct.pack('>f', target))
-        self.io.query(cmd)  # reply has no data
-        return self.read_target()
-
     def _calibration_info(self, info_type, location):
         '''Get Calibration Information (0x40) about one memory location.
         info_type: 0x10 valid, 0x11 gas, 0x12 gas ID, 0x13 unit, 0x14 fullscale'''
@@ -446,22 +437,56 @@ class SFC5xxx(HasIO, Drivable):
         self.calibrations = calibrations
         self.log.info('found %d valid calibrations', len(calibrations))
 
-    @Command(IntRange(0, 255))
-    def load_calibration(self, location):
-        '''Load the calibration at <location> (see calibrations) and run the controller.
+    @Command(StringType())
+    def load_calibration(self, gas):
+        '''Load the calibration of <gas> (see calibrations) and run the controller.
 
         Writes the EEPROM (limited write cycles, manual 5.7.1), so use it to
         change gas, never periodically. Reloading the current one is harmless.
         '''
-        valid = [c['location'] for c in self.calibrations]
-        if location not in valid:
-            raise RangeError(f'no valid calibration at location {location} (valid: {valid}).'
-                             ' Run refresh_calibrations if the list is empty')
-        cmd = replace(COMMANDS['load_calibration'], data=struct.pack('>I', location))
+
+        valid_gases = [c['gas'] for c in self.calibrations]
+        if gas not in valid_gases:
+            raise RangeError(f'no valid calibration of gas {gas} (valid gases: {valid_gases}).'
+                                         ' Run refresh_calibrations if the list is empty')
+        for c in self.calibrations:
+            if gas == c['gas']:
+                calib_loc = c['location']
+
+        cmd = replace(COMMANDS['load_calibration'], data=struct.pack('>I', calib_loc))
         self.io.query(cmd)  # reply has no data
         # update the parameters that describe the loaded calibration
         self.read_gas()
         self.read_gas_ID()
         self.read_units()
         self.read_conductivity()
-        self.read_target()
+        if isinstance(self.target):
+            self.read_target()
+
+
+class MassFlowController(MassFlowSensor, Drivable):
+
+    target = Parameter('Target flow rate', FloatRange(unit='slm'))
+
+    def read_target(self):
+        reply = self.io.query(COMMANDS['read_setpoint'])
+        return struct.unpack('>f', reply)[0]
+
+    def write_target(self, target):
+        # replace() makes a copy, so the shared COMMANDS entry is not modified
+        cmd = replace(COMMANDS['write_setpoint'], data=struct.pack('>f', target))
+        self.io.query(cmd)  # reply has no data
+        return self.read_target()
+
+    @Command()
+    def dose_volume(self, volume, dose_time):
+        '''
+        Dose volume of gas over a given amount of time. Volume is in standard litres and time
+        is in minutes.
+        '''
+        flow_rate = volume / dose_time
+
+        self.write_target(flow_rate)
+        time.sleep(dose_time)
+
+        self.write_target(0)
