@@ -282,6 +282,13 @@ class TemperatureLoop(ScannerChannel, mercury.TemperatureLoop):
             except AttributeError:
                 pass  # output_module is None or an instance of HeaterOutput
 
+    def read_closed_loop_mode(self):
+        return self.query('DEV::TEMP:LOOP:MODE')
+
+    def write_closed_loop_mode(self, value):
+        self.change(f'DEV::TEMP:LOOP:MODE:{value}')
+        return self.read_closed_loop_mode()
+
 
 class HeaterOutput(HasInput, MercuryChannel, Writable):
     """heater output"""
