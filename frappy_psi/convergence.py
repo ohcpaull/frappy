@@ -87,7 +87,7 @@ class HasConvergence:
 
     def convergence_min_slope(self, dif):
         """calculate minimum expected slope"""
-        slope = getattr(self, 'workingramp', 0) or getattr(self, 'ramp', 0)
+        slope = abs(getattr(self, 'workingramp', 0)) or getattr(self, 'ramp', 0)  # workingramp may be signed
         if slope or not self.timeout:
             return slope
         return dif / self.timeout  # assume exponential decay of dif, with time constant <tolerance>
