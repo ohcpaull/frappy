@@ -4,6 +4,9 @@ html/*
 *.pyc
 pid/*
 
+# Config directory 
+/cfg/*
+
 # ide
 .idea
 
