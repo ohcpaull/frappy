@@ -157,6 +157,14 @@ class TemperatureLoop(TemperatureSensor, TemperatureSetpoint, Drivable):
         self.status = BUSY, 'target changed'
         return self.read_setpoint()
 
+    def read_setpoint(self):
+        # Override TemperatureSetpoint.read_setpoint, which queries the `output`
+        # property. For a control loop the setpoint belongs to `loop`; `output`
+        # defaults to 1 and is never set in the cfg files, so without this every
+        # loop-2 module read (and wrote back into its target) the loop-1 setpoint.
+        reply = self.communicate(f'SETP?{self.loop}')
+        return float(reply)
+
     def read_status(self):
         code = int(self.communicate(f'RDGST?{self.channel}'))
         if code >= 128:
